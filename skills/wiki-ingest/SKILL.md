@@ -13,10 +13,18 @@ Execute this disciplined 4-stage workflow whenever ingesting one or more raw sou
 
 ---
 
-## Stage 1: Inspect Existing Wiki & Analyze the Source
-1. Call `wiki_get(file="wiki/index.md")` (and `wiki_schema(mode="read")` if needed) to inspect existing pages and canonical slugs.
+## Stage 1: Inspect Existing Wiki, Topic Folders, Tags & Analyze the Source
+1. Call `wiki_get(file="wiki/index.md")`, `wiki_tree(scope="wiki")` (and `wiki_metadata` or `wiki_schema(mode="read")` if needed) to inspect existing pages, canonical slugs, **existing topic folders**, and **existing tag prefixes**.
 2. Read the raw source via `wiki_get(file="sources/<source_rel_path>")` (or chunk-by-chunk using `from_line` / `max_lines` for very long sources).
 3. Perform a structured analysis covering:
+   - **Topic & Folder Classification (Derived from Source)**:
+     - Identify the primary `domain` (e.g., `algo-trading`, `ai-engineering`, `distributed-systems`) and `topic` (e.g., `grid-dca`, `hybrid-search`, `volatility-filtering`) of the source.
+     - Determine target folder routing: reuse an existing topic folder from `wiki_tree` first, or propose a clean `kebab-case` topic folder (max 2 levels deep) if `SCHEMA.md` or user preferences organize pages by topic subfolders.
+   - **3-Facet Topic Tags (Derived from Source)**:
+     - Prepare hierarchical Obsidian + QMD tags:
+       1. Category tag (`"wiki/source"`, `"wiki/entity"`, `"wiki/concept"`)
+       2. Hierarchical topic tags (`"topic/<domain>/<subtopic>"`, e.g., `"topic/trading/grid-dca"`)
+       3. Specific subject/technology tags (`"<tech-or-keyword>"`, e.g., `"mql5"`, `"atr-indicator"`)
    - **Key Entities (`Page-worthy: yes | no`)**: Identify candidate named things. Only mark `Page-worthy: yes` if central, recurring, or carrying substantive claims. Reuse existing slugs from `wiki/index.md`!
    - **Key Concepts (`Page-worthy: yes | no`)**: Identify core methods, algorithms, strategies, or frameworks.
    - **Main Arguments, Findings & Verbatim Structured Data**:
@@ -27,13 +35,13 @@ Execute this disciplined 4-stage workflow whenever ingesting one or more raw sou
 ---
 
 ## Stage 2: Compile the Source Summary Page (`wiki_ingest_source`)
-Call `wiki_ingest_source` for `source_rel_path` (do NOT invent a random filename; `wiki_ingest_source` automatically preserves the exact source filename under `wiki/sources/<source_rel_path>`):
+Call `wiki_ingest_source` for `source_rel_path` (do NOT invent a random filename; `wiki_ingest_source` automatically preserves the exact source filename under `wiki/sources/<source_rel_path>`, or under `target_wiki_path="sources/<domain>/<topic>/<filename>.md"` if routing flat sources into a topic subfolder):
 - `source_rel_path`: `"<source_rel_path>"`
 - `title`: Human-readable title
 - `one_line_summary`: Concise 1-sentence summary for `wiki/index.md`
-- `tags`: Relevant domain tags
-- `related_entities`: Canonical `entities/<slug>` stems (`Page-worthy: yes` only)
-- `related_concepts`: Canonical `concepts/<slug>` stems (`Page-worthy: yes` only)
+- `tags`: Hierarchical topic tags (`["topic/<domain>/<subtopic>", "<tech>", "<keyword>"]`; `"wiki/source"` is added automatically)
+- `related_entities`: Canonical `entities/<slug>` (or `entities/<topic>/<slug>`) stems (`Page-worthy: yes` only)
+- `related_concepts`: Canonical `concepts/<slug>` (or `concepts/<topic>/<slug>`) stems (`Page-worthy: yes` only)
 - `wiki_markdown_body`: A comprehensive, deeply structured Markdown article containing:
   1. **Context & Core Thesis**: Purpose of the source and how it connects to existing `[[wiki/sources/...]]` pages.
   2. **Detailed Technical / Factual Breakdown**: All core claims, rules, parameters, code blocks, SQL/schemas, or formulas preserved verbatim, with inline `[[entities/<slug>|Label]]` and `[[concepts/<slug>|Label]]` links.
