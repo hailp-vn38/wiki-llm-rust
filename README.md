@@ -28,10 +28,15 @@ Thư viện Rust local-first kết hợp kiến trúc **LLM Wiki** của Andrej 
 # Chạy toàn bộ test suite
 cargo test
 
-# Chạy ví dụ minh họa toàn bộ luồng hoạt động
+# Chạy ví dụ minh họa toàn bộ luồng hoạt động cơ bản
 cargo run --example full_workflow
+
+# Chạy ví dụ Live YouTube Playlist -> Raw Source Markdown -> Karpathy LLM Wiki (dùng orchestrator-agent)
+cp .env.live.example .env.live   # điền G0_OPENAI_BASE_URL, G0_OPENAI_MODEL, G0_OPENAI_API_KEY
+cargo run --example youtube_playlist_wiki -- "<PLAYLIST_URL>" --limit 3 --lang en,vi
 ```
 
 Xem chi tiết thiết kế kiến trúc và luồng xử lý tại:
 - [ARCHITECTURE.md](./ARCHITECTURE.md) — Đặc tả kỹ thuật, SQLite schema, thuật toán QMD & Rust API.
 - [docs/karpathy-llm-wiki.md](./docs/karpathy-llm-wiki.md) — Nguyên bản ý tưởng "LLM Wiki" của Andrej Karpathy và bảng ánh xạ vào `llm-wiki-rs`.
+- [examples/youtube_playlist_wiki.rs](./examples/youtube_playlist_wiki.rs) — Ứng dụng mẫu tích hợp [`orchestrator-agent`](https://crates.io/crates/orchestrator-agent) để xử lý YouTube Playlist thành Raw Sources (`sources/youtube/`) và tự động tổng hợp, liên kết chéo `[[WikiLinks]]`, kiểm tra sức khỏe (`lint_wiki`) trong `wiki/`.

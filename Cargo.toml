@@ -18,3 +18,10 @@ blake3 = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2.0"
 unicode-normalization = "0.1"
+
+[dev-dependencies]
+orchestrator-agent = "0.2.0"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+uuid = { version = "1", features = ["v4"] }
+

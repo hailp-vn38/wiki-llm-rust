@@ -4,12 +4,27 @@ pub mod error;
 pub mod fs;
 pub mod graph;
 pub mod markdown;
+pub mod prompts;
 pub mod search;
 pub mod tools;
 pub mod types;
 pub mod wiki;
 
 pub use config::{ChunkConfig, WikiConfig, WikiSourceLayout};
+pub use prompts::{
+    all_wiki_templates, apply_wikilink_substitutions, build_chunk_analysis_system_prompt,
+    build_chunk_analysis_user_prompt, build_enrich_wikilinks_system_prompt,
+    build_evidence_quality_gate_system_prompt, build_ingest_analysis_prompt,
+    build_ingest_batch_generation_prompt, build_ingest_tool_agent_prompt,
+    build_language_directive, build_language_reminder, build_page_merge_system_prompt,
+    build_page_merge_user_prompt, build_query_agent_system_prompt,
+    build_research_synthesis_prompt, build_semantic_lint_prompt,
+    build_truncated_file_repair_prompt, detect_language_prompt_name, get_wiki_template,
+    is_safe_ingest_wiki_path, parse_file_blocks, parse_review_blocks, parse_semantic_lint_blocks,
+    IngestPromptContext, OutputLanguage, ParseFileBlocksResult, ParsedFileBlock,
+    ParsedReviewBlock, ParsedSemanticLintBlock, ReviewBlockType, SemanticLintIssueType,
+    WikiRetrievalMode, WikiTemplate, WikiTemplateId, WikilinkSubstitution,
+};
 pub use db::filter_sql::{
     ComparisonOperator, LogicalOperator, MetadataCondition, MetadataFilter, NotOperator,
 };
@@ -355,7 +370,9 @@ impl WikiEngine {
             });
         }
 
-        let (wiki_scoped_path, file_name) = if let Some(ref custom_target) = req.target_wiki_path {
+        let (wiki_scoped_path, file_name) = if let Some(ref custom_target) =
+            req.target_wiki_path.as_ref().filter(|s| !s.trim().is_empty())
+        {
             let clean_target = ensure_markdown_extension(custom_target)?;
             let prefix = format!("{}/", self.config.wiki_dir_name);
             let scoped = clean_target
@@ -451,6 +468,41 @@ impl WikiEngine {
             file_name,
             wiki_docid: wiki_doc_info.docid,
         })
+    }
+
+    /// Apply a batch of Stage 2 LLM `---FILE: wiki/...---` blocks directly into the `WikiEngine`,
+    /// automatically validating paths, indexing all written pages into SQLite + Obsidian Graph View,
+    /// refreshing `wiki/index.md`, and appending an ingest record to `wiki/log.md`.
+    pub fn apply_ingest_file_blocks(
+        &self,
+        source_rel_path: &str,
+        raw_llm_output: &str,
+    ) -> WikiResult<(ParseFileBlocksResult, Vec<String>)> {
+        let parsed = parse_file_blocks(raw_llm_output);
+        let mut written_rel_paths = Vec::new();
+
+        for block in &parsed.blocks {
+            let scoped = block
+                .path
+                .strip_prefix("wiki/")
+                .unwrap_or(&block.path);
+            if scoped == "index.md" || scoped == "log.md" {
+                continue;
+            }
+            let info = self.write_wiki_file(scoped, &block.content)?;
+            written_rel_paths.push(info.rel_path);
+        }
+
+        if !written_rel_paths.is_empty() {
+            self.rebuild_or_sync_index_md()?;
+            let details: Vec<String> = written_rel_paths
+                .iter()
+                .map(|p| format!("Wrote wiki page: `{p}`"))
+                .collect();
+            self.append_log(LogAction::Ingest, source_rel_path, &details)?;
+        }
+
+        Ok((parsed, written_rel_paths))
     }
 
     /// File a valuable query answer / synthesis back into `wiki/syntheses/`

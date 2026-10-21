@@ -185,12 +185,13 @@ pub fn build_llm_tool_definitions() -> Vec<LlmToolSpec> {
             description: "Create or overwrite a Markdown file inside `wiki` or `sources`. Automatically creates any nested parent folders (e.g. 'docs/flow/lib.md' creates `docs` and `docs/flow`). Indexes the file into SQLite FTS5, chunks, and Obsidian Graph View.".to_string(),
             parameters: json!({
                 "type": "object",
-                "required": ["scope", "rel_path", "content"],
+                "required": ["rel_path", "content"],
                 "properties": {
                     "scope": {
                         "type": "string",
                         "enum": ["wiki", "sources"],
-                        "description": "Target collection folder ('wiki' or 'sources')."
+                        "default": "wiki",
+                        "description": "Target collection folder ('wiki' or 'sources'). Defaults to 'wiki'."
                     },
                     "rel_path": {
                         "type": "string",
@@ -213,11 +214,13 @@ pub fn build_llm_tool_definitions() -> Vec<LlmToolSpec> {
             description: "Modify an existing Markdown file in `wiki` or `sources` by replacing a target text block or appending a new section.".to_string(),
             parameters: json!({
                 "type": "object",
-                "required": ["scope", "rel_path"],
+                "required": ["rel_path"],
                 "properties": {
                     "scope": {
                         "type": "string",
-                        "enum": ["wiki", "sources"]
+                        "enum": ["wiki", "sources"],
+                        "default": "wiki",
+                        "description": "Target collection folder ('wiki' or 'sources'). Defaults to 'wiki'."
                     },
                     "rel_path": {
                         "type": "string"

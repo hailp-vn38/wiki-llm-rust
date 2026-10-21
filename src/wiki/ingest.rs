@@ -14,10 +14,10 @@ pub struct IngestSourceRequest {
     /// Optional existing wiki page path (inside `wiki/`) to update instead of creating a new file.
     /// Useful when a new source document only supplements an already-existing wiki page
     /// (e.g. `Some("sources/docs/flow/lib.md")` or `Some("entities/rust.md")`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_non_empty_opt_string")]
     pub target_wiki_path: Option<String>,
     /// Optional raw content if you want `ingest_source_to_wiki` to also create/save the source file on disk first.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_non_empty_opt_string")]
     pub raw_source_content: Option<String>,
     /// Human-readable title for the wiki summary page.
     pub title: String,
@@ -34,6 +34,20 @@ pub struct IngestSourceRequest {
     /// Related concept page names (e.g. `["bm25-search", "smart-chunking"]`).
     #[serde(default)]
     pub related_concepts: Vec<String>,
+}
+
+fn deserialize_non_empty_opt_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    Ok(opt.and_then(|s| {
+        if s.trim().is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }))
 }
 
 /// Response returned after ingesting a source into the wiki.
@@ -188,7 +202,14 @@ pub fn render_source_wiki_markdown(
     let mut missing_entity_links = Vec::new();
     for ent in &req.related_entities {
         let clean = ent.trim().trim_matches(|c| c == '[' || c == ']');
-        if !clean.is_empty() && !req.wiki_markdown_body.contains(&format!("[[{clean}")) {
+        let already_in_body = req.wiki_markdown_body.contains(&format!("[[{clean}"))
+            || req
+                .wiki_markdown_body
+                .contains(&format!("[[entities/{clean}"))
+            || req
+                .wiki_markdown_body
+                .contains(&format!("[[wiki/entities/{clean}"));
+        if !clean.is_empty() && !already_in_body {
             missing_entity_links.push(format!("[[entities/{clean}|{clean}]]"));
         }
     }
@@ -196,7 +217,14 @@ pub fn render_source_wiki_markdown(
     let mut missing_concept_links = Vec::new();
     for con in &req.related_concepts {
         let clean = con.trim().trim_matches(|c| c == '[' || c == ']');
-        if !clean.is_empty() && !req.wiki_markdown_body.contains(&format!("[[{clean}")) {
+        let already_in_body = req.wiki_markdown_body.contains(&format!("[[{clean}"))
+            || req
+                .wiki_markdown_body
+                .contains(&format!("[[concepts/{clean}"))
+            || req
+                .wiki_markdown_body
+                .contains(&format!("[[wiki/concepts/{clean}"));
+        if !clean.is_empty() && !already_in_body {
             missing_concept_links.push(format!("[[concepts/{clean}|{clean}]]"));
         }
     }

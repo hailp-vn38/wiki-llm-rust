@@ -268,6 +268,9 @@ pub fn execute_tool_call(engine: &WikiEngine, tool_name: &str, args: Value) -> W
                     tool: tool_name.to_string(),
                     message: "Missing required string parameter `rel_path`".to_string(),
                 })?;
+            let prefix = format!("{}/", scope.as_str());
+            let clean_rel = rel_path.trim_start_matches('/');
+            let clean_scoped = clean_rel.strip_prefix(&prefix).unwrap_or(clean_rel);
             let content = args
                 .get("content")
                 .and_then(|v| v.as_str())
@@ -280,7 +283,7 @@ pub fn execute_tool_call(engine: &WikiEngine, tool_name: &str, args: Value) -> W
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
 
-            let info = engine.write_file(scope, rel_path, content)?;
+            let info = engine.write_file(scope, clean_scoped, content)?;
             if scope == CollectionScope::Wiki && update_index {
                 let _ = engine.rebuild_or_sync_index_md();
             }
@@ -303,8 +306,11 @@ pub fn execute_tool_call(engine: &WikiEngine, tool_name: &str, args: Value) -> W
                     message: "Missing `rel_path`".to_string(),
                 })?;
 
+            let prefix = format!("{}/", scope.as_str());
+            let clean_rel = rel_path.trim_start_matches('/');
+            let clean_scoped = clean_rel.strip_prefix(&prefix).unwrap_or(clean_rel);
             let existing = engine.get_document(
-                &format!("{}/{}", scope.as_str(), rel_path.trim_start_matches('/')),
+                &format!("{}/{clean_scoped}", scope.as_str()),
                 GetOptions::default(),
             )?;
 
@@ -313,26 +319,36 @@ pub fn execute_tool_call(engine: &WikiEngine, tool_name: &str, args: Value) -> W
                 args.get("target_text").and_then(|v| v.as_str()),
                 args.get("replacement_text").and_then(|v| v.as_str()),
             ) {
-                if !updated.contains(target) {
-                    return Err(WikiError::InvalidToolArguments {
-                        tool: tool_name.to_string(),
-                        message: format!("`target_text` not found in '{}'", existing.info.rel_path),
-                    });
+                if !target.is_empty() {
+                    if !updated.contains(target) {
+                        return Err(WikiError::InvalidToolArguments {
+                            tool: tool_name.to_string(),
+                            message: format!(
+                                "`target_text` not found in '{}'",
+                                existing.info.rel_path
+                            ),
+                        });
+                    }
+                    updated = updated.replace(target, replacement);
                 }
-                updated = updated.replace(target, replacement);
             }
 
             if let Some(append_text) = args.get("append_text").and_then(|v| v.as_str()) {
-                if !updated.ends_with('\n') {
-                    updated.push('\n');
-                }
-                updated.push_str(append_text);
-                if !updated.ends_with('\n') {
-                    updated.push('\n');
+                if !append_text.is_empty() && !updated.contains(append_text.trim()) {
+                    if !updated.ends_with('\n') {
+                        updated.push('\n');
+                    }
+                    updated.push_str(append_text);
+                    if !updated.ends_with('\n') {
+                        updated.push('\n');
+                    }
                 }
             }
 
             let info = engine.write_file(scope, &existing.info.scoped_path, &updated)?;
+            if scope == CollectionScope::Wiki {
+                let _ = engine.rebuild_or_sync_index_md();
+            }
             Ok(serde_json::to_value(info)?)
         }
 
