@@ -108,6 +108,21 @@ pub fn map_source_to_wiki_scoped_path(
     Ok((wiki_scoped, file_name))
 }
 
+fn strip_leading_frontmatter(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    if let Some(after_open) = trimmed.strip_prefix("---\n").or_else(|| trimmed.strip_prefix("---\r\n")) {
+        if let Some(end_idx) = after_open.find("\n---\n").or_else(|| after_open.find("\r\n---\r\n")) {
+            let skip = if after_open[end_idx..].starts_with("\r\n---\r\n") {
+                end_idx + 7
+            } else {
+                end_idx + 5
+            };
+            return after_open[skip..].trim_start();
+        }
+    }
+    trimmed
+}
+
 /// Format the full Markdown document for a source summary or updated wiki page in `wiki/`,
 /// including Obsidian-compatible YAML frontmatter, QMD metadata, and `[[WikiLinks]]`.
 /// Supports multiple contributing raw sources (`previous_sources`) when updating an existing wiki page.
@@ -117,6 +132,7 @@ pub fn render_source_wiki_markdown(
     source_file_name: &str,
     previous_source_rel_paths: &[String],
 ) -> String {
+    let body_without_fm = strip_leading_frontmatter(&req.wiki_markdown_body);
     let now = Utc::now().to_rfc3339();
     let mut tags = vec!["wiki/source".to_string()];
     for t in &req.tags {
@@ -176,7 +192,7 @@ pub fn render_source_wiki_markdown(
         "---\ntitle: \"{escaped_title}\"\ncategory: \"source_summary\"\nsummary: \"{escaped_summary}\"\nsource_file: \"{source_wikilink}\"\nsource_count: {source_count}\nsources:\n{sources_wikilink_yaml}\ntags:\n{tags_yaml}\nupdated_at: \"{now}\"\nqmd:\n  metadata:\n    category: \"source_summary\"\n    source_file: \"{vault_source_rel_path}\"\n    source_count: {source_count}\n    sources:\n{sources_plain_yaml}\n    tags:\n{qmd_tags_yaml}\n---\n\n"
     );
 
-    if !req.wiki_markdown_body.trim_start().starts_with("# ") {
+    if !body_without_fm.starts_with("# ") {
         out.push_str(&format!("# {}\n\n", req.title));
     }
 
@@ -197,7 +213,7 @@ pub fn render_source_wiki_markdown(
         req.one_line_summary.trim()
     ));
 
-    let clean_body = sanitize_mermaid_fences(req.wiki_markdown_body.trim());
+    let clean_body = sanitize_mermaid_fences(body_without_fm.trim());
     out.push_str(&clean_body);
     out.push('\n');
 
@@ -299,7 +315,8 @@ pub fn render_synthesis_markdown(req: &FileSynthesisRequest) -> String {
         "---\ntitle: \"{escaped_title}\"\ncategory: \"synthesis\"\nsummary: \"{escaped_summary}\"\nquery: \"{escaped_query}\"\ntags:\n{tags_yaml}\nupdated_at: \"{now}\"\nqmd:\n  metadata:\n    category: \"synthesis\"\n    tags:\n{qmd_tags_yaml}\n---\n\n"
     );
 
-    if !req.markdown_body.trim_start().starts_with("# ") {
+    let body_without_fm = strip_leading_frontmatter(&req.markdown_body);
+    if !body_without_fm.starts_with("# ") {
         out.push_str(&format!("# {}\n\n", req.title));
     }
     out.push_str(&format!(
@@ -307,7 +324,7 @@ pub fn render_synthesis_markdown(req: &FileSynthesisRequest) -> String {
         req.query.trim(),
         req.one_line_summary.trim()
     ));
-    let clean_body = sanitize_mermaid_fences(req.markdown_body.trim());
+    let clean_body = sanitize_mermaid_fences(body_without_fm.trim());
     out.push_str(&clean_body);
     out.push('\n');
     out

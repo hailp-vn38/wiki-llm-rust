@@ -3,4 +3,5 @@
 .env.live
 .env.live.*
 !.env.live.example
+*.pdf
 

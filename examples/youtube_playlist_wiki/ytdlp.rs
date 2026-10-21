@@ -1,7 +1,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub(crate) use llm_wiki::{slugify, vtt_to_text};
+pub(crate) use llm_wiki::vtt_to_text;
 use orchestrator_agent_rs::ToolError;
 
 use crate::tools::tool_err;

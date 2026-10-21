@@ -535,7 +535,7 @@ fn test_req5_llm_tools_end_to_end() {
         .unwrap();
     assert!(tree_res["ascii_tree"].as_str().unwrap().contains("lib.md"));
 
-    // 7. Call `wiki_query`
+    // 7. Call `wiki_query` (defaults to `collections: ["wiki"]` and includes WikiLink relationships)
     let query_res = engine
         .execute_llm_tool(
             "wiki_query",
@@ -548,7 +548,32 @@ fn test_req5_llm_tools_end_to_end() {
             }),
         )
         .unwrap();
-    assert!(query_res["count"].as_u64().unwrap() >= 1);
+    let results_arr = query_res["results"].as_array().unwrap();
+    assert!(!results_arr.is_empty());
+    // Default collection is `wiki`, so no raw `sources` documents should be returned
+    assert!(results_arr.iter().all(|r| r["collection"] == "wiki"));
+
+    let flow_wiki_hit = results_arr
+        .iter()
+        .find(|r| r["rel_path"] == "wiki/sources/docs/flow/lib.md")
+        .expect("Expected wiki/sources/docs/flow/lib.md in wiki_query results");
+    assert_eq!(flow_wiki_hit["is_wiki_linked"], true);
+    let out_links: Vec<&str> = flow_wiki_hit["outgoing_links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(out_links.contains(&"sources/docs/flow/lib.md"));
+    assert!(out_links.contains(&"wiki/entities/rust.md"));
+    let back_links: Vec<&str> = flow_wiki_hit["backlinks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(back_links.contains(&"wiki/entities/rust.md"));
+    assert!(!back_links.contains(&"wiki/index.md"));
 
     // 8. Call `wiki_get` & `wiki_multi_get`
     let get_res = engine
@@ -979,6 +1004,186 @@ fn test_flow_utilities_and_adaptive_tool_executor() {
         .unwrap();
     assert!(del_out.content.contains("deleted=true"));
     assert!(!root.join("wiki/concepts/temp-dup.md").exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Test Multi-Topic Vault upgrades:
+/// 1. Topic-prioritized Compact Index (`read_compact_index_md_for_topic`) never starves a newly added topic
+///    even when an earlier topic has many pages.
+/// 2. `unsynthesized_topics()` and `build_next_autoflow_prompt()` track per-topic synthesis coverage
+///    independently across multiple `<domain>/<topic>` folders.
+#[test]
+fn test_multi_topic_compact_index_and_per_topic_autoflow_synthesis() {
+    let root = create_temp_vault("multi_topic_upgrade");
+    let engine = WikiEngine::open(&root).unwrap();
+
+    // 1. Populate Topic A (`algo-trading/mql5-dca`) with multiple entities, concepts, source summary, and synthesis
+    let mut topic_a_entities = Vec::new();
+    for i in 1..=25 {
+        let slug = format!("trading-indicator-{i:02}");
+        engine
+            .write_wiki_file(
+                &format!("entities/{slug}.md"),
+                &format!(
+                    "---\ntitle: \"Trading Indicator {i:02}\"\ncategory: \"entity\"\ndomain: \"algo-trading\"\ntopic: \"mql5-dca\"\n---\n\n# Trading Indicator {i:02}\nUsed in [[wiki/sources/algo-trading/mql5-dca/bot-v1|Bot v1]]."
+                ),
+            )
+            .unwrap();
+        topic_a_entities.push(slug);
+    }
+    engine
+        .ingest_source_to_wiki(IngestSourceRequest {
+            source_rel_path: "algo-trading/mql5-dca/bot-v1.md".to_string(),
+            target_wiki_path: None,
+            raw_source_content: Some("# MQL5 DCA Bot v1\nRaw transcript.".to_string()),
+            title: "MQL5 DCA Bot v1".to_string(),
+            one_line_summary: "DCA Bot implementation in MQL5.".to_string(),
+            wiki_markdown_body: "Uses [[entities/trading-indicator-01|Trading Indicator 01]]."
+                .to_string(),
+            tags: vec!["topic/algo-trading/mql5-dca".to_string()],
+            related_entities: topic_a_entities,
+            related_concepts: vec![],
+        })
+        .unwrap();
+
+    // Before creating a synthesis for Topic A, `unsynthesized_topics` reports `algo-trading/mql5-dca`
+    assert_eq!(
+        engine.unsynthesized_topics().unwrap(),
+        vec!["algo-trading/mql5-dca".to_string()]
+    );
+
+    // File synthesis for Topic A and link it so there are no orphans
+    engine
+        .file_query_synthesis(llm_wiki::FileSynthesisRequest {
+            rel_path: "syntheses/mql5-dca-synthesis.md".to_string(),
+            query: "MQL5 DCA overview".to_string(),
+            title: "MQL5 DCA Synthesis".to_string(),
+            one_line_summary: "Synthesis of MQL5 DCA strategies.".to_string(),
+            markdown_body:
+                "Synthesizes [[wiki/sources/algo-trading/mql5-dca/bot-v1|MQL5 DCA Bot v1]]."
+                    .to_string(),
+            tags: vec!["topic/algo-trading/mql5-dca".to_string()],
+        })
+        .unwrap();
+    engine
+        .execute_llm_tool(
+            "wiki_patch_file",
+            json!({
+                "scope": "wiki",
+                "rel_path": "sources/algo-trading/mql5-dca/bot-v1.md",
+                "append_text": "\n- [[wiki/syntheses/mql5-dca-synthesis|MQL5 DCA Synthesis]]\n"
+            }),
+        )
+        .unwrap();
+
+    assert!(engine.unsynthesized_topics().unwrap().is_empty());
+
+    // 2. Now add a completely different Topic B (`ai-engineering/hybrid-search`)
+    engine
+        .write_wiki_file(
+            "concepts/reciprocal-rank-fusion.md",
+            "---\ntitle: \"Reciprocal Rank Fusion\"\ncategory: \"concept\"\ndomain: \"ai-engineering\"\ntopic: \"hybrid-search\"\n---\n\n# Reciprocal Rank Fusion\nUsed in [[wiki/sources/ai-engineering/hybrid-search/qmd-paper|QMD Paper]].",
+        )
+        .unwrap();
+    engine
+        .ingest_source_to_wiki(IngestSourceRequest {
+            source_rel_path: "ai-engineering/hybrid-search/qmd-paper.md".to_string(),
+            target_wiki_path: None,
+            raw_source_content: Some("# QMD Paper\nHybrid retrieval with RRF.".to_string()),
+            title: "QMD Hybrid Search Paper".to_string(),
+            one_line_summary: "QMD hybrid search architecture.".to_string(),
+            wiki_markdown_body: "Combines BM25 and vector search via [[concepts/reciprocal-rank-fusion|Reciprocal Rank Fusion]].".to_string(),
+            tags: vec!["topic/ai-engineering/hybrid-search".to_string()],
+            related_entities: vec![],
+            related_concepts: vec!["reciprocal-rank-fusion".to_string()],
+        })
+        .unwrap();
+
+    // Even with a tight 800-char budget, `read_compact_index_md_for_topic` for Topic B
+    // MUST include Topic B's concept and source summary first without being starved by the 25 Topic A entities!
+    let compact_b = engine
+        .read_compact_index_md_for_topic(800, Some("ai-engineering/hybrid-search"))
+        .unwrap();
+    assert!(compact_b.contains("reciprocal-rank-fusion"));
+    assert!(compact_b.contains("sources/ai-engineering/hybrid-search/qmd-paper"));
+
+    // And `unsynthesized_topics()` + `build_next_autoflow_prompt()` detect that Topic B lacks a synthesis page!
+    assert_eq!(
+        engine.unsynthesized_topics().unwrap(),
+        vec!["ai-engineering/hybrid-search".to_string()]
+    );
+    let next_prompt = engine.build_next_autoflow_prompt(None).unwrap().unwrap();
+    assert!(next_prompt.contains("[AUTO-FLOW: WIKI LINT]"));
+    assert!(next_prompt.contains("ai-engineering/hybrid-search"));
+
+    // Once Topic B's synthesis page is created and linked, `build_next_autoflow_prompt` returns `None`!
+    engine
+        .file_query_synthesis(llm_wiki::FileSynthesisRequest {
+            rel_path: "syntheses/hybrid-search-synthesis.md".to_string(),
+            query: "Hybrid search synthesis".to_string(),
+            title: "Hybrid Search Synthesis".to_string(),
+            one_line_summary: "Synthesis of QMD hybrid search.".to_string(),
+            markdown_body:
+                "Synthesizes [[wiki/sources/ai-engineering/hybrid-search/qmd-paper|QMD Paper]]."
+                    .to_string(),
+            tags: vec!["topic/ai-engineering/hybrid-search".to_string()],
+        })
+        .unwrap();
+    engine
+        .execute_llm_tool(
+            "wiki_patch_file",
+            json!({
+                "scope": "wiki",
+                "rel_path": "sources/ai-engineering/hybrid-search/qmd-paper.md",
+                "append_text": "\n- [[wiki/syntheses/hybrid-search-synthesis|Hybrid Search Synthesis]]\n"
+            }),
+        )
+        .unwrap();
+
+    assert!(engine.unsynthesized_topics().unwrap().is_empty());
+    assert!(engine.build_next_autoflow_prompt(None).unwrap().is_none());
+
+    // 3. Verify 1-Level `<domain>` Folder Routing, Global Unique Slug Redirect, and On-Disk WikiLink Healing
+    assert!(root
+        .join("wiki/entities/algo-trading/trading-indicator-01.md")
+        .is_file());
+    assert!(root
+        .join("wiki/concepts/ai-engineering/reciprocal-rank-fusion.md")
+        .is_file());
+    assert!(root
+        .join("wiki/syntheses/algo-trading/mql5-dca-synthesis.md")
+        .is_file());
+    assert!(root
+        .join("wiki/syntheses/ai-engineering/hybrid-search-synthesis.md")
+        .is_file());
+
+    // Global Unique Slug Redirect: writing `entities/ai-engineering/trading-indicator-01.md` must redirect to `wiki/entities/algo-trading/trading-indicator-01.md`
+    let redirected = engine
+        .write_wiki_file(
+            "entities/ai-engineering/trading-indicator-01.md",
+            "---\ntitle: \"Trading Indicator 01\"\ncategory: \"entity\"\ndomain: \"ai-engineering\"\n---\n\n# Trading Indicator 01\nUsed in [[wiki/sources/algo-trading/mql5-dca/bot-v1|Bot v1]] and [[wiki/sources/ai-engineering/hybrid-search/qmd-paper|QMD Paper]].",
+        )
+        .unwrap();
+    assert_eq!(
+        redirected.rel_path,
+        "wiki/entities/algo-trading/trading-indicator-01.md"
+    );
+    assert!(!root
+        .join("wiki/entities/ai-engineering/trading-indicator-01.md")
+        .exists());
+
+    // On-disk WikiLink healing: `qmd-paper.md` links are rewritten to include `<domain>` so Obsidian resolves them natively
+    let qmd_on_disk =
+        std::fs::read_to_string(root.join("wiki/sources/ai-engineering/hybrid-search/qmd-paper.md"))
+            .unwrap();
+    assert!(qmd_on_disk
+        .contains("[[concepts/ai-engineering/reciprocal-rank-fusion|Reciprocal Rank Fusion]]"));
+    assert!(qmd_on_disk
+        .contains("[[wiki/syntheses/ai-engineering/hybrid-search-synthesis|Hybrid Search Synthesis]]"));
+
+    let lint = engine.lint_wiki().unwrap();
+    assert!(lint.is_healthy, "Expected healthy vault, got: {lint:?}");
 
     let _ = std::fs::remove_dir_all(&root);
 }

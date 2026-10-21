@@ -1,9 +1,23 @@
 [package]
-name = "llm-wiki"
+name = "llm-wiki-rs"
 version = "0.1.0"
 edition = "2021"
-description = "Local-first LLM Wiki & QMD Hybrid Search Engine compatible with Obsidian Graph View"
-license = "MIT"
+description = "Local-first Karpathy LLM Wiki & QMD Hybrid Search Engine compatible with Obsidian Graph View"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hailp-vn38/wiki-llm-rust"
+homepage = "https://github.com/hailp-vn38/wiki-llm-rust"
+documentation = "https://docs.rs/llm-wiki-rs"
+readme = "README.md"
+keywords = ["llm", "wiki", "obsidian", "search", "sqlite"]
+categories = ["database", "text-processing", "science"]
+exclude = [
+    "docs/*.pdf",
+    ".env*",
+]
+
+[lib]
+name = "llm_wiki"
+path = "src/lib.rs"
 
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled", "functions"] }
@@ -20,6 +34,9 @@ thiserror = "2.0"
 unicode-normalization = "0.1"
 
 [dev-dependencies]
+anydoc = "0.2.4"
+lopdf = "0.45"
+pdf-inspector = "1.25"
 orchestrator-agent = "0.2.0"
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }

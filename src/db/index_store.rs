@@ -1,13 +1,13 @@
 use crate::config::WikiConfig;
 use crate::error::{WikiError, WikiResult};
-use crate::fs::file_ops::slice_and_format_lines;
+use crate::fs::file_ops::{slice_and_format_lines, slugify};
 use crate::fs::path_guard::{
     compute_content_hash, compute_docid, parse_target_with_line_range, sanitize_rel_path,
 };
 use crate::fs::tree::TreeDocMeta;
 use crate::graph::link_resolver::resolve_all_links_in_db;
 use crate::markdown::chunker::smart_chunk_markdown;
-use crate::markdown::frontmatter::TypedMetaValue;
+use crate::markdown::frontmatter::{parse_frontmatter, TypedMetaValue};
 use crate::markdown::parser::parse_markdown_document;
 use crate::types::{
     CollectionScope, DocumentInfo, DocumentResult, GetOptions, MultiGetError, MultiGetOptions,
@@ -16,7 +16,7 @@ use crate::types::{
 use chrono::Utc;
 use globset::Glob;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
@@ -311,6 +311,7 @@ pub fn index_single_file(
 
     if resolve_links_immediately {
         resolve_all_links_in_db(conn)?;
+        heal_category_wikilinks_on_disk(conn, config)?;
     }
 
     let info = get_document_info_by_id(conn, doc_id)?;
@@ -503,6 +504,7 @@ pub fn sync_filesystem(conn: &Connection, config: &WikiConfig) -> WikiResult<Syn
 
     // Resolve all Obsidian graph links across the vault
     resolve_all_links_in_db(conn)?;
+    heal_category_wikilinks_on_disk(conn, config)?;
 
     stats.total_chunks = conn.query_row("SELECT COUNT(*) FROM content_chunks", [], |r| {
         r.get::<_, i64>(0)
@@ -716,6 +718,35 @@ fn find_document_id_flexible(conn: &Connection, target: &str) -> WikiResult<Opti
         .optional()?
     {
         return Ok(Some(id));
+    }
+
+    // 2b. Domain-scoped category lookup (`entities/<domain>/<slug>.md`, `concepts/<domain>/<slug>.md`, `syntheses/<domain>/<slug>.md`)
+    let target_lower = target.to_ascii_lowercase();
+    let without_wiki = target_lower.strip_prefix("wiki/").unwrap_or(&target_lower);
+    for cat_prefix in ["entities/", "concepts/", "syntheses/"] {
+        if without_wiki.starts_with(cat_prefix) {
+            let leaf = without_wiki.rsplit('/').next().unwrap_or(without_wiki);
+            let leaf_stem = leaf.strip_suffix(".md").unwrap_or(leaf);
+            if !leaf_stem.is_empty() {
+                let like_pattern = format!("{cat_prefix}%");
+                if let Some(id) = conn
+                    .query_row(
+                        "SELECT id FROM documents
+                         WHERE collection = 'wiki'
+                           AND lower(scoped_path) LIKE ?1
+                           AND (lower(file_stem) = ?2 OR lower(file_name) = ?3)
+                         ORDER BY length(rel_path) ASC
+                         LIMIT 1",
+                        params![like_pattern, leaf_stem, leaf],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                {
+                    return Ok(Some(id));
+                }
+            }
+            break;
+        }
     }
 
     // 3. Match on `file_stem` or `file_name` (case-insensitive)
@@ -971,6 +1002,57 @@ pub fn resolve_path_context_for_doc(
     }
 }
 
+/// Resolve outgoing `[[WikiLinks]]`, incoming backlinks (excluding system files `index.md` / `log.md`),
+/// and unresolved link targets for a document in `SearchResultItem`.
+pub fn resolve_wiki_links_for_doc(
+    conn: &Connection,
+    doc_id: i64,
+    doc_rel_path: &str,
+) -> WikiResult<(Vec<String>, Vec<String>, Vec<String>)> {
+    let mut out_stmt = conn.prepare(
+        "SELECT resolved_rel_path, target_path_spec
+         FROM graph_links
+         WHERE source_doc_id = ?1
+         ORDER BY line_number ASC, id ASC",
+    )?;
+    let out_rows = out_stmt.query_map(params![doc_id], |r| {
+        Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?))
+    })?;
+
+    let mut outgoing_links = Vec::new();
+    let mut unresolved_links = Vec::new();
+    for row in out_rows {
+        let (resolved_opt, target_spec) = row?;
+        if let Some(target_rel) = resolved_opt {
+            if target_rel != doc_rel_path && !outgoing_links.contains(&target_rel) {
+                outgoing_links.push(target_rel);
+            }
+        } else if !target_spec.is_empty() && !unresolved_links.contains(&target_spec) {
+            unresolved_links.push(target_spec);
+        }
+    }
+
+    let mut back_stmt = conn.prepare(
+        "SELECT DISTINCT gl.source_rel_path
+         FROM graph_links gl
+         JOIN documents src ON src.id = gl.source_doc_id
+         WHERE gl.resolved_doc_id = ?1
+           AND COALESCE(src.category, '') != 'system'
+         ORDER BY gl.source_rel_path ASC",
+    )?;
+    let back_rows = back_stmt.query_map(params![doc_id], |r| r.get::<_, String>(0))?;
+
+    let mut backlinks = Vec::new();
+    for row in back_rows {
+        let src_rel = row?;
+        if src_rel != doc_rel_path && !backlinks.contains(&src_rel) {
+            backlinks.push(src_rel);
+        }
+    }
+
+    Ok((outgoing_links, backlinks, unresolved_links))
+}
+
 /// Set or update a QMD Path Context description.
 pub fn upsert_path_context(
     conn: &Connection,
@@ -1012,4 +1094,311 @@ pub fn get_all_path_contexts(conn: &Connection) -> WikiResult<Vec<PathContextIte
         items.push(row?);
     }
     Ok(items)
+}
+
+/// Extract the canonical `<domain>` folder slug (e.g. `"quantitative-finance"`, `"ai-engineering"`, `"shared"`)
+/// from a Markdown document's YAML frontmatter (`domain` property or `topic/<domain>/...` tag).
+pub fn extract_domain_from_markdown_frontmatter(markdown_content: &str) -> Option<String> {
+    let fm = parse_frontmatter(markdown_content);
+    if let Some(TypedMetaValue::String(d)) = fm.qmd_metadata.get("domain") {
+        let slug = slugify(d, 40);
+        if !slug.is_empty() {
+            return Some(slug);
+        }
+    }
+    if let Some(ref map) = fm.json_map {
+        if let Some(d) = map.get("domain").and_then(|v| v.as_str()) {
+            let slug = slugify(d, 40);
+            if !slug.is_empty() {
+                return Some(slug);
+            }
+        }
+    }
+    for tag in &fm.tags {
+        let clean = tag.trim().trim_start_matches('#');
+        if let Some(rest) = clean.strip_prefix("topic/") {
+            let first_seg = rest.split('/').next().unwrap_or(rest).trim();
+            let slug = slugify(first_seg, 40);
+            if !slug.is_empty() {
+                return Some(slug);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the canonical `scoped_path` inside `wiki/` for `entities/`, `concepts/`, and `syntheses/` pages:
+/// 1. **Global Unique Slug Redirect**: If a page with the same `file_stem` already exists anywhere under
+///    the same category folder (`entities/.../<slug>.md`, `concepts/.../<slug>.md`, `syntheses/.../<slug>.md`),
+///    always redirect to that existing `scoped_path` to prevent duplicate files across domains/topics.
+/// 2. **1-Level `<domain>` Folder Routing**: For a new page in `entities/`, `concepts/`, or `syntheses/`,
+///    if the Markdown frontmatter specifies `domain: "<domain>"` (or a `topic/<domain>/...` tag),
+///    automatically organize it under `<category>/<domain>/<slug>.md` (or `<category>/shared/<slug>.md`).
+pub fn resolve_canonical_wiki_scoped_path(
+    conn: &Connection,
+    requested_scoped: &str,
+    markdown_content: &str,
+) -> WikiResult<String> {
+    let clean_requested = sanitize_rel_path(requested_scoped)?;
+    let lower_req = clean_requested.to_ascii_lowercase();
+
+    for cat_prefix in ["entities/", "concepts/", "syntheses/"] {
+        if lower_req.starts_with(cat_prefix) {
+            let rest = &clean_requested[cat_prefix.len()..];
+            let file_name = rest.rsplit('/').next().unwrap_or(rest);
+            let file_stem = file_name.strip_suffix(".md").unwrap_or(file_name);
+            if file_stem.is_empty() {
+                return Ok(clean_requested);
+            }
+
+            // 1. Check if a page with the same `file_stem` already exists anywhere in this category
+            let like_pattern = format!("{cat_prefix}%");
+            if let Some(existing_scoped) = conn
+                .query_row(
+                    "SELECT scoped_path FROM documents
+                     WHERE collection = 'wiki'
+                       AND lower(scoped_path) LIKE ?1
+                       AND lower(file_stem) = lower(?2)
+                     ORDER BY
+                        CASE WHEN lower(scoped_path) = lower(?3) THEN 0 ELSE 1 END,
+                        length(scoped_path) ASC
+                     LIMIT 1",
+                    params![like_pattern, file_stem, clean_requested],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                return Ok(existing_scoped);
+            }
+
+            // 2. If explicitly placed in `shared/<slug>.md`, preserve `shared`
+            let rest_lower = rest.to_ascii_lowercase();
+            if rest_lower.starts_with("shared/") {
+                return Ok(format!("{cat_prefix}shared/{file_name}"));
+            }
+
+            // 3. If frontmatter specifies `domain` (or `topic/<domain>/...`), organize into 1-level `<category>/<domain>/<file_name>`
+            if let Some(domain) = extract_domain_from_markdown_frontmatter(markdown_content) {
+                return Ok(format!("{cat_prefix}{domain}/{file_name}"));
+            }
+
+            return Ok(clean_requested);
+        }
+    }
+
+    Ok(clean_requested)
+}
+
+/// Rewrite category-prefixed Obsidian `[[WikiLinks]]` (`[[entities/...]]`, `[[concepts/...]]`, `[[syntheses/...]]`)
+/// outside fenced code blocks so their path matches the canonical `scoped_path` on disk (e.g. `[[entities/quantitative-finance/aiv-bank|AIV Bank]]`).
+pub fn heal_category_wikilinks_in_markdown(
+    markdown: &str,
+    canonical_map: &HashMap<(String, String), String>,
+) -> String {
+    if canonical_map.is_empty() || !markdown.contains("[[") {
+        return markdown.to_string();
+    }
+
+    let mut out_lines = Vec::new();
+    let mut in_fence = false;
+
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            out_lines.push(line.to_string());
+            continue;
+        }
+        if in_fence || !line.contains("[[") {
+            out_lines.push(line.to_string());
+            continue;
+        }
+
+        let mut healed_line = String::with_capacity(line.len());
+        let mut rest = line;
+        while let Some(open_idx) = rest.find("[[") {
+            healed_line.push_str(&rest[..open_idx]);
+            let after_open = &rest[open_idx + 2..];
+            if let Some(close_idx) = after_open.find("]]") {
+                let inner = &after_open[..close_idx];
+                let (before_pipe, alias_suffix) = match inner.find('|') {
+                    Some(p) => (&inner[..p], &inner[p..]),
+                    None => (inner, ""),
+                };
+                let (raw_path, heading_suffix) = match before_pipe.find('#') {
+                    Some(h) => (&before_pipe[..h], &before_pipe[h..]),
+                    None => (before_pipe, ""),
+                };
+                let clean_path = raw_path.trim().replace('\\', "/");
+                let clean_lower = clean_path.to_ascii_lowercase();
+                let has_wiki_prefix = clean_lower.starts_with("wiki/");
+                let without_wiki = if has_wiki_prefix {
+                    &clean_path[5..]
+                } else {
+                    clean_path.as_str()
+                };
+                let without_wiki_lower = without_wiki.to_ascii_lowercase();
+
+                let mut rewritten_path: Option<String> = None;
+                for cat in ["entities", "concepts", "syntheses"] {
+                    let prefix = format!("{cat}/");
+                    if without_wiki_lower.starts_with(&prefix) {
+                        let leaf = without_wiki_lower
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&without_wiki_lower);
+                        let leaf_stem = leaf.strip_suffix(".md").unwrap_or(leaf);
+                        if let Some(canonical_scoped_no_ext) =
+                            canonical_map.get(&(cat.to_string(), leaf_stem.to_string()))
+                        {
+                            let md_ext = if without_wiki_lower.ends_with(".md") {
+                                ".md"
+                            } else {
+                                ""
+                            };
+                            let candidate = if has_wiki_prefix {
+                                format!("wiki/{canonical_scoped_no_ext}{md_ext}")
+                            } else {
+                                format!("{canonical_scoped_no_ext}{md_ext}")
+                            };
+                            if !candidate.eq_ignore_ascii_case(&clean_path) {
+                                rewritten_path = Some(candidate);
+                            }
+                        }
+                        break;
+                    }
+                }
+
+                healed_line.push_str("[[");
+                if let Some(new_p) = rewritten_path {
+                    healed_line.push_str(&new_p);
+                } else {
+                    healed_line.push_str(raw_path);
+                }
+                healed_line.push_str(heading_suffix);
+                healed_line.push_str(alias_suffix);
+                healed_line.push_str("]]");
+                rest = &after_open[close_idx + 2..];
+            } else {
+                healed_line.push_str(&rest[open_idx..]);
+                rest = "";
+                break;
+            }
+        }
+        healed_line.push_str(rest);
+        out_lines.push(healed_line);
+    }
+
+    let mut joined = out_lines.join("\n");
+    if markdown.ends_with('\n') && !joined.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
+}
+
+/// Synchronize category-prefixed `[[WikiLinks]]` on disk for any `wiki` pages whose link targets
+/// (`entities/...`, `concepts/...`, `syntheses/...`) are stored inside `<domain>` subfolders.
+pub fn heal_category_wikilinks_on_disk(conn: &Connection, config: &WikiConfig) -> WikiResult<usize> {
+    let mut cat_stmt = conn.prepare(
+        "SELECT scoped_path, file_stem
+         FROM documents
+         WHERE collection = 'wiki'
+           AND (scoped_path LIKE 'entities/%' OR scoped_path LIKE 'concepts/%' OR scoped_path LIKE 'syntheses/%')",
+    )?;
+    let rows = cat_stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+
+    let mut canonical_map: HashMap<(String, String), String> = HashMap::new();
+    for row in rows {
+        let (scoped_path, file_stem) = row?;
+        let cat = scoped_path
+            .split('/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let scoped_no_ext = scoped_path
+            .strip_suffix(".md")
+            .unwrap_or(&scoped_path)
+            .to_string();
+        canonical_map.insert((cat, file_stem.to_ascii_lowercase()), scoped_no_ext);
+    }
+
+    if canonical_map.is_empty() {
+        return Ok(0);
+    }
+
+    let mut link_stmt = conn.prepare(
+        "SELECT src.scoped_path, src.rel_path, gl.target_path_spec
+         FROM graph_links gl
+         JOIN documents src ON src.id = gl.source_doc_id
+         WHERE src.collection = 'wiki'
+           AND src.scoped_path NOT IN ('index.md', 'log.md')",
+    )?;
+    let link_rows = link_stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+
+    let mut files_to_heal: BTreeSet<(String, String)> = BTreeSet::new();
+    for row in link_rows {
+        let (src_scoped, src_rel, target_spec) = row?;
+        let spec_clean = target_spec.trim().trim_start_matches('/').replace('\\', "/");
+        let spec_lower = spec_clean.to_ascii_lowercase();
+        let without_wiki = spec_lower.strip_prefix("wiki/").unwrap_or(&spec_lower);
+        let without_wiki_no_md = without_wiki.strip_suffix(".md").unwrap_or(without_wiki);
+
+        for cat in ["entities", "concepts", "syntheses"] {
+            let prefix = format!("{cat}/");
+            if without_wiki_no_md.starts_with(&prefix) {
+                let leaf_stem = without_wiki_no_md
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(without_wiki_no_md);
+                if let Some(canonical_scoped_no_ext) =
+                    canonical_map.get(&(cat.to_string(), leaf_stem.to_string()))
+                {
+                    if !canonical_scoped_no_ext.eq_ignore_ascii_case(without_wiki_no_md) {
+                        files_to_heal.insert((src_scoped.clone(), src_rel.clone()));
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    if files_to_heal.is_empty() {
+        return Ok(0);
+    }
+
+    let mut healed_count = 0usize;
+    for (src_scoped, src_rel) in &files_to_heal {
+        let full_path = config.data_root.join(src_rel);
+        if !full_path.exists() {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&full_path)?;
+        let healed = heal_category_wikilinks_in_markdown(&raw, &canonical_map);
+        if healed != raw {
+            std::fs::write(&full_path, &healed)?;
+            index_single_file(
+                conn,
+                config,
+                CollectionScope::Wiki,
+                src_scoped,
+                &full_path,
+                false,
+            )?;
+            healed_count += 1;
+        }
+    }
+
+    if healed_count > 0 {
+        resolve_all_links_in_db(conn)?;
+    }
+
+    Ok(healed_count)
 }

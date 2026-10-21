@@ -40,10 +40,14 @@ pub struct SubQuery {
 
 pub type ExpandedQuery = SubQuery;
 
+pub fn default_query_collections() -> Vec<CollectionScope> {
+    vec![CollectionScope::Wiki]
+}
+
 /// Options for direct `search_lex` or `search_vec` calls.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchOptions {
-    #[serde(default)]
+    #[serde(default = "default_query_collections")]
     pub collections: Vec<CollectionScope>,
     pub filter: Option<MetadataFilter>,
     pub limit: usize,
@@ -53,7 +57,7 @@ pub struct SearchOptions {
 impl Default for SearchOptions {
     fn default() -> Self {
         Self {
-            collections: Vec::new(),
+            collections: default_query_collections(),
             filter: None,
             limit: 10,
             min_score: 0.0,
@@ -69,8 +73,8 @@ pub struct HybridQueryRequest {
     /// Typed sub-queries (`lex`, `vec`, `hyde`). First entry receives 2x RRF weight.
     #[serde(default)]
     pub searches: Vec<SubQuery>,
-    /// Collections to search (`wiki`, `sources`). Empty = search both.
-    #[serde(default)]
+    /// Collections to search (`wiki`, `sources`). Defaults to `wiki` (`[CollectionScope::Wiki]`).
+    #[serde(default = "default_query_collections")]
     pub collections: Vec<CollectionScope>,
     /// Recursive QMD metadata filter AST.
     pub filter: Option<MetadataFilter>,
@@ -93,7 +97,7 @@ impl Default for HybridQueryRequest {
         Self {
             query: None,
             searches: Vec::new(),
-            collections: Vec::new(),
+            collections: default_query_collections(),
             filter: None,
             intent: None,
             limit: 10,
@@ -139,6 +143,18 @@ pub struct SearchResultItem {
     pub context: Option<String>,
     /// Extracted QMD metadata map.
     pub metadata: BTreeMap<String, serde_json::Value>,
+    /// Whether this document has at least one resolved outgoing `[[WikiLink]]` or incoming backlink.
+    #[serde(default)]
+    pub is_wiki_linked: bool,
+    /// Resolved target `rel_path`s linked from this document via `[[WikiLinks]]`.
+    #[serde(default)]
+    pub outgoing_links: Vec<String>,
+    /// Resolved `source_rel_path`s of documents that link to this document via `[[WikiLinks]]` (excluding `wiki/index.md` and `wiki/log.md`).
+    #[serde(default)]
+    pub backlinks: Vec<String>,
+    /// Unresolved/dangling `[[WikiLinks]]` in this document that do not yet match any file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_links: Vec<String>,
     /// Optional explain trace (`--explain`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explain: Option<SearchExplainTrace>,

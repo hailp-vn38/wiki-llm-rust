@@ -236,51 +236,317 @@ pub fn generate_index_md_content(
 /// Default character budget for compact index injection (mirrors `javis-os` `WIKI_INDEX_MAX = 2500`).
 pub const DEFAULT_COMPACT_INDEX_MAX_CHARS: usize = 3_000;
 
-/// Build a compact, slug-oriented Wiki Index inspired by `javis-os` (`learn._read_index`):
-/// - Lists existing `wiki/sources/`, `wiki/entities/`, `wiki/concepts/`, and `wiki/syntheses/` slugs
-///   with titles and `aliases` (omitting verbose descriptions and timestamps to save context tokens).
-/// - Stops cleanly at a line boundary if `max_chars` is reached and appends an explicit overflow notice
-///   telling the agent how many pages were omitted and instructing it to call `wiki_query`/`wiki_tree`.
+/// Extract `<domain>/<topic>` (or `<domain>`) for a document from its frontmatter JSON or scoped path.
+pub fn extract_topic_from_doc(
+    scoped_path: &str,
+    category: &str,
+    fm_json: Option<&str>,
+) -> Option<String> {
+    if let Some(js) = fm_json {
+        if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(js) {
+            let domain = map
+                .get("domain")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let topic = map
+                .get("topic")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            match (domain, topic) {
+                (Some(d), Some(t)) if d != t => return Some(format!("{d}/{t}")),
+                (Some(d), _) => return Some(d.to_string()),
+                (None, Some(t)) => return Some(t.to_string()),
+                _ => {}
+            }
+
+            if let Some(serde_json::Value::Array(tags)) = map.get("tags") {
+                for tag in tags.iter().filter_map(|v| v.as_str()) {
+                    let clean = tag.trim().trim_start_matches('#');
+                    if let Some(rest) = clean.strip_prefix("topic/") {
+                        if !rest.trim().is_empty() {
+                            return Some(rest.trim().to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let clean = scoped_path.trim_start_matches('/');
+    if category == "source_summary" || clean.starts_with("sources/") {
+        let under_sources = clean.strip_prefix("sources/").unwrap_or(clean);
+        if let Some((parent, _)) = under_sources.rsplit_once('/') {
+            if !parent.trim().is_empty() {
+                return Some(parent.trim().to_string());
+            }
+        }
+    } else {
+        for prefix in ["entities/", "concepts/", "syntheses/"] {
+            if let Some(rest) = clean.strip_prefix(prefix) {
+                if let Some((parent, _)) = rest.rsplit_once('/') {
+                    if !parent.trim().is_empty() {
+                        return Some(parent.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Infer the most recently active `<domain>/<topic>` in the Vault from the latest indexed source or wiki page.
+pub fn infer_latest_active_topic(conn: &Connection) -> Option<String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT scoped_path, COALESCE(category, ''), frontmatter_json
+             FROM documents
+             WHERE scoped_path NOT IN ('index.md', 'log.md')
+             ORDER BY
+                CASE WHEN collection = 'sources' OR category = 'source_summary' THEN 0 ELSE 1 END,
+                id DESC
+             LIMIT 15",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .ok()?;
+
+    for row in rows.flatten() {
+        if let Some(t) = extract_topic_from_doc(&row.0, &row.1, row.2.as_deref()) {
+            return Some(t);
+        }
+    }
+    None
+}
+
+/// Find all `<domain>/<topic>` folders under `wiki/sources/` that do not yet have a corresponding
+/// synthesis page in `wiki/syntheses/`.
+pub fn find_unsynthesized_topics(conn: &Connection) -> WikiResult<Vec<String>> {
+    let mut src_stmt = conn.prepare(
+        "SELECT id, scoped_path, file_stem, frontmatter_json
+         FROM documents
+         WHERE collection = 'wiki' AND (category = 'source_summary' OR scoped_path LIKE 'sources/%')",
+    )?;
+    let src_rows = src_stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+
+    // Map topic_folder -> list of (doc_id, scoped_path, file_stem)
+    let mut topic_sources: std::collections::BTreeMap<String, Vec<(i64, String, String)>> =
+        std::collections::BTreeMap::new();
+    for row in src_rows {
+        let (doc_id, scoped_path, file_stem, fm_json) = row?;
+        if let Some(topic) =
+            extract_topic_from_doc(&scoped_path, "source_summary", fm_json.as_deref())
+        {
+            topic_sources
+                .entry(topic)
+                .or_default()
+                .push((doc_id, scoped_path, file_stem));
+        }
+    }
+
+    if topic_sources.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut synth_stmt = conn.prepare(
+        "SELECT id, scoped_path, title, raw_body, COALESCE(frontmatter_json, '')
+         FROM documents
+         WHERE collection = 'wiki' AND (category = 'synthesis' OR scoped_path LIKE 'syntheses/%')",
+    )?;
+    struct SynthDoc {
+        id: i64,
+        scoped_path: String,
+        title: String,
+        raw_body: String,
+        fm_json: String,
+    }
+    let syntheses: Vec<SynthDoc> = synth_stmt
+        .query_map([], |r| {
+            Ok(SynthDoc {
+                id: r.get(0)?,
+                scoped_path: r.get(1)?,
+                title: r.get(2)?,
+                raw_body: r.get(3)?,
+                fm_json: r.get(4)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if syntheses.is_empty() {
+        return Ok(topic_sources.into_keys().collect());
+    }
+
+    // Load graph links between synthesis pages and source summary pages
+    let mut linked_doc_pairs: std::collections::HashSet<(i64, i64)> =
+        std::collections::HashSet::new();
+    if let Ok(mut link_stmt) = conn.prepare(
+        "SELECT source_doc_id, resolved_doc_id
+         FROM graph_links
+         WHERE resolved_doc_id IS NOT NULL",
+    ) {
+        if let Ok(rows) = link_stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+        {
+            for pair in rows.flatten() {
+                linked_doc_pairs.insert(pair);
+            }
+        }
+    }
+
+    let mut unsynthesized = Vec::new();
+    for (topic, sources) in topic_sources {
+        let topic_lower = topic.to_ascii_lowercase();
+        let topic_leaf = topic_lower
+            .rsplit_once('/')
+            .map(|(_, leaf)| leaf)
+            .unwrap_or(&topic_lower);
+
+        let is_covered = syntheses.iter().any(|s| {
+            let synth_topic =
+                extract_topic_from_doc(&s.scoped_path, "synthesis", Some(&s.fm_json))
+                    .map(|t| t.to_ascii_lowercase());
+            if synth_topic.as_deref() == Some(topic_lower.as_str()) {
+                return true;
+            }
+            let haystack = format!(
+                "{} {} {} {}",
+                s.scoped_path.to_ascii_lowercase(),
+                s.title.to_ascii_lowercase(),
+                s.fm_json.to_ascii_lowercase(),
+                s.raw_body.to_ascii_lowercase()
+            );
+            if haystack.contains(&topic_lower)
+                || (topic_leaf.len() >= 3 && haystack.contains(topic_leaf))
+            {
+                return true;
+            }
+            sources.iter().any(|(src_id, src_scoped, src_stem)| {
+                linked_doc_pairs.contains(&(s.id, *src_id))
+                    || linked_doc_pairs.contains(&(*src_id, s.id))
+                    || haystack.contains(&src_scoped.to_ascii_lowercase())
+                    || (src_stem.len() >= 4 && haystack.contains(&src_stem.to_ascii_lowercase()))
+            })
+        });
+
+        if !is_covered {
+            unsynthesized.push(topic);
+        }
+    }
+
+    Ok(unsynthesized)
+}
+
+/// Build a compact, slug-oriented Wiki Index inspired by `javis-os` (`learn._read_index`).
+/// Delegates to [`generate_compact_index_md_for_topic`] with automatic active-topic prioritization.
 pub fn generate_compact_index_md(
     conn: &Connection,
     config: &WikiConfig,
     max_chars: usize,
 ) -> WikiResult<String> {
+    generate_compact_index_md_for_topic(conn, config, max_chars, None)
+}
+
+/// Build a topic-aware compact Wiki Index for Multi-Topic Vaults:
+/// - Prioritizes pages belonging to `preferred_topic` (or the most recently active `<domain>/<topic>`
+///   when `preferred_topic` is `None`) so the active topic's Entities, Concepts, Sources, and Syntheses
+///   are never starved by older topics when the Vault grows large.
+/// - Fills any remaining `max_chars` budget with pages from other topics (most recent first) to enable
+///   cross-domain `[[WikiLink]]` reuse.
+pub fn generate_compact_index_md_for_topic(
+    conn: &Connection,
+    config: &WikiConfig,
+    max_chars: usize,
+    preferred_topic: Option<&str>,
+) -> WikiResult<String> {
+    let active_topic = preferred_topic
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_start_matches("sources/").trim_start_matches("topic/").to_string())
+        .or_else(|| infer_latest_active_topic(conn));
+
+    let active_lower = active_topic.as_ref().map(|s| s.to_ascii_lowercase());
+    let active_domain = active_lower
+        .as_deref()
+        .map(|t| t.split('/').next().unwrap_or(t));
+
     let mut stmt = conn.prepare(
-        "SELECT rel_path, scoped_path, title, category, aliases_json
+        "SELECT id, rel_path, scoped_path, title, category, aliases_json, frontmatter_json
          FROM documents
          WHERE collection = 'wiki' AND scoped_path NOT IN ('index.md', 'log.md')
-         ORDER BY
-            CASE category
-                WHEN 'entity' THEN 0
-                WHEN 'concept' THEN 1
-                WHEN 'source_summary' THEN 2
-                WHEN 'synthesis' THEN 3
-                ELSE 4
-            END,
-            scoped_path ASC",
+         ORDER BY id DESC",
     )?;
 
     struct CompactItem {
+        id: i64,
         rel_path: String,
         scoped_path: String,
         title: String,
         category: String,
+        cat_order: u8,
         aliases: Vec<String>,
+        topic: Option<String>,
+        topic_tier: u8,
     }
 
-    let items: Vec<CompactItem> = stmt
+    let mut items: Vec<CompactItem> = stmt
         .query_map([], |r| {
-            let aliases_json: String = r.get(4)?;
+            let id: i64 = r.get(0)?;
+            let rel_path: String = r.get(1)?;
+            let scoped_path: String = r.get(2)?;
+            let title: String = r.get(3)?;
+            let category = r
+                .get::<_, Option<String>>(4)?
+                .unwrap_or_else(|| "wiki_page".to_string());
+            let aliases_json: String = r.get(5)?;
+            let fm_json: Option<String> = r.get(6)?;
             let aliases: Vec<String> = serde_json::from_str(&aliases_json).unwrap_or_default();
+            let topic = extract_topic_from_doc(&scoped_path, &category, fm_json.as_deref());
+            let topic_lower = topic.as_ref().map(|t| t.to_ascii_lowercase());
+            let item_domain = topic_lower
+                .as_deref()
+                .map(|t| t.split('/').next().unwrap_or(t));
+
+            let is_shared = item_domain == Some("shared")
+                || scoped_path.to_ascii_lowercase().starts_with("entities/shared/");
+            let topic_tier = match (&active_lower, &topic_lower) {
+                (Some(act), Some(it)) if act == it || it.starts_with(&format!("{act}/")) || act.starts_with(&format!("{it}/")) => 0,
+                _ if active_domain.is_some() && (active_domain == item_domain || is_shared) => 1,
+                _ => 2,
+            };
+
+            let cat_order = match category.as_str() {
+                "entity" => 0,
+                "concept" => 1,
+                "source_summary" => 2,
+                "synthesis" => 3,
+                _ => 4,
+            };
+
             Ok(CompactItem {
-                rel_path: r.get(0)?,
-                scoped_path: r.get(1)?,
-                title: r.get(2)?,
-                category: r
-                    .get::<_, Option<String>>(3)?
-                    .unwrap_or_else(|| "wiki_page".to_string()),
+                id,
+                rel_path,
+                scoped_path,
+                title,
+                category,
+                cat_order,
                 aliases,
+                topic,
+                topic_tier,
             })
         })?
         .filter_map(|r| r.ok())
@@ -293,24 +559,31 @@ pub fn generate_compact_index_md(
         ));
     }
 
+    // 1. Select items within budget by prioritizing `topic_tier` (0 -> 1 -> 2), then category order, then recency (`id DESC`)
+    items.sort_by(|a, b| {
+        a.topic_tier
+            .cmp(&b.topic_tier)
+            .then_with(|| a.cat_order.cmp(&b.cat_order))
+            .then_with(|| b.id.cmp(&a.id))
+            .then_with(|| a.scoped_path.cmp(&b.scoped_path))
+    });
+
     let budget = max_chars.max(400);
-    let mut out = format!(
-        "# Compact Wiki Index (`{}/index.md` — {} trang)\n",
-        config.wiki_dir_name,
-        items.len()
-    );
-    let mut current_cat = String::new();
-    let mut included = 0usize;
+    let header = if let Some(ref act) = active_topic {
+        format!(
+            "# Compact Wiki Index (`{}/index.md` — {} trang, ưu tiên chủ đề: `{act}`)\n",
+            config.wiki_dir_name,
+            items.len()
+        )
+    } else {
+        format!(
+            "# Compact Wiki Index (`{}/index.md` — {} trang)\n",
+            config.wiki_dir_name,
+            items.len()
+        )
+    };
 
-    for item in &items {
-        let section_header = match item.category.as_str() {
-            "entity" => "## Entities (`wiki/entities/`)\n",
-            "concept" => "## Concepts (`wiki/concepts/`)\n",
-            "source_summary" => "## Sources (`wiki/sources/`)\n",
-            "synthesis" => "## Syntheses (`wiki/syntheses/`)\n",
-            _ => "## Other (`wiki/`)\n",
-        };
-
+    let format_item_line = |item: &CompactItem| -> String {
         let link_target = item
             .rel_path
             .strip_suffix(".md")
@@ -324,28 +597,68 @@ pub fn generate_compact_index_md(
         } else {
             format!(" [aliases: {}]", item.aliases.join(", "))
         };
-        let line = format!("- `{slug}` -> [[{link_target}|{}]]{alias_suffix}\n", item.title);
+        let topic_suffix = match (&item.topic, item.category.as_str()) {
+            (Some(t), "entity" | "concept" | "synthesis") => format!(" (topic: {t})"),
+            _ => String::new(),
+        };
+        format!(
+            "- `{slug}` -> [[{link_target}|{}]]{alias_suffix}{topic_suffix}\n",
+            item.title
+        )
+    };
 
-        let needed = (if current_cat != item.category {
-            section_header.len()
-        } else {
-            0
-        }) + line.len();
+    let section_header_for = |cat: &str| -> &'static str {
+        match cat {
+            "entity" => "## Entities (`wiki/entities/`)\n",
+            "concept" => "## Concepts (`wiki/concepts/`)\n",
+            "source_summary" => "## Sources (`wiki/sources/`)\n",
+            "synthesis" => "## Syntheses (`wiki/syntheses/`)\n",
+            _ => "## Other (`wiki/`)\n",
+        }
+    };
 
-        if included > 0 && out.len() + needed > budget {
-            let remaining = items.len() - included;
-            out.push_str(&format!(
-                "... (còn {remaining} trang nữa không liệt kê hết — dùng `wiki_query` hoặc `wiki_tree` để kiểm tra trước khi tạo trang mới)\n"
-            ));
+    // Reserve space for up to 4 section headers so reordering by category after selection stays within budget
+    let mut used_chars = header.len() + 140;
+    let mut selected_indices = Vec::new();
+
+    for (idx, item) in items.iter().enumerate() {
+        let line = format_item_line(item);
+        if !selected_indices.is_empty() && used_chars + line.len() > budget {
             break;
         }
+        used_chars += line.len();
+        selected_indices.push(idx);
+    }
 
+    let total_items = items.len();
+    let included = selected_indices.len();
+
+    // Sort selected items by `(cat_order, topic_tier, scoped_path)` so output is cleanly grouped by category
+    selected_indices.sort_by(|&ia, &ib| {
+        let a = &items[ia];
+        let b = &items[ib];
+        a.cat_order
+            .cmp(&b.cat_order)
+            .then_with(|| a.topic_tier.cmp(&b.topic_tier))
+            .then_with(|| a.scoped_path.cmp(&b.scoped_path))
+    });
+
+    let mut out = header;
+    let mut current_cat = String::new();
+    for idx in selected_indices {
+        let item = &items[idx];
         if current_cat != item.category {
             current_cat = item.category.clone();
-            out.push_str(section_header);
+            out.push_str(section_header_for(&item.category));
         }
-        out.push_str(&line);
-        included += 1;
+        out.push_str(&format_item_line(item));
+    }
+
+    if included < total_items {
+        let remaining = total_items - included;
+        out.push_str(&format!(
+            "... (còn {remaining} trang thuộc các chủ đề khác không liệt kê hết — dùng `wiki_query` hoặc `wiki_tree` để kiểm tra trước khi tạo trang mới)\n"
+        ));
     }
 
     Ok(out)

@@ -69,7 +69,8 @@ pub use wiki::log_md::{LogAction, LogEntry};
 
 use crate::db::index_store::{
     get_all_path_contexts, index_single_file, load_tree_metadata_map, multi_get_documents,
-    remove_document_by_rel_path, retrieve_document, sync_filesystem, upsert_path_context,
+    remove_document_by_rel_path, resolve_canonical_wiki_scoped_path, retrieve_document,
+    sync_filesystem, upsert_path_context,
 };
 use crate::db::schema::init_database;
 use crate::fs::file_ops::{delete_nested_file, move_nested_file, write_nested_file};
@@ -86,8 +87,8 @@ use crate::search::vector::{embed_pending_documents, search_vector};
 use crate::tools::definitions::build_llm_tool_definitions;
 use crate::tools::executor::execute_tool_call;
 use crate::wiki::index_md::{
-    generate_compact_index_md, generate_index_md_content, DEFAULT_COMPACT_INDEX_MAX_CHARS,
-    DEFAULT_SCHEMA_MD,
+    extract_topic_from_doc, find_unsynthesized_topics, generate_compact_index_md_for_topic,
+    generate_index_md_content, DEFAULT_COMPACT_INDEX_MAX_CHARS, DEFAULT_SCHEMA_MD,
 };
 use crate::wiki::ingest::{
     normalize_source_scoped_path, render_source_wiki_markdown, render_synthesis_markdown,
@@ -323,10 +324,15 @@ impl WikiEngine {
         let clean_scoped_input = md_rel_path.strip_prefix(&prefix).unwrap_or(&md_rel_path);
 
         let sanitized = sanitize_mermaid_fences(content);
-        let (clean_scoped, full_path) =
-            write_nested_file(&base_dir, clean_scoped_input, &sanitized)?;
-
         let conn = self.db.lock().unwrap();
+        let target_scoped = if scope == CollectionScope::Wiki {
+            resolve_canonical_wiki_scoped_path(&conn, clean_scoped_input, &sanitized)?
+        } else {
+            clean_scoped_input.to_string()
+        };
+        let (clean_scoped, full_path) =
+            write_nested_file(&base_dir, &target_scoped, &sanitized)?;
+
         let (info, _) =
             index_single_file(&conn, &self.config, scope, &clean_scoped, &full_path, true)?;
         Ok(info)
@@ -644,13 +650,31 @@ impl WikiEngine {
     /// Generate a compact, token-budgeted Wiki Index (`slug -> [[path|Title]] [aliases]`)
     /// inspired by `javis-os` `_read_index`, capping output at `max_chars` (or `DEFAULT_COMPACT_INDEX_MAX_CHARS` if 0).
     pub fn read_compact_index_md(&self, max_chars: usize) -> WikiResult<String> {
+        self.read_compact_index_md_for_topic(max_chars, None)
+    }
+
+    /// Generate a topic-prioritized compact Wiki Index for Multi-Topic Vaults:
+    /// guarantees pages belonging to `preferred_topic` (or the latest active `<domain>/<topic>` if `None`)
+    /// are listed first before filling remaining `max_chars` budget with other topics.
+    pub fn read_compact_index_md_for_topic(
+        &self,
+        max_chars: usize,
+        preferred_topic: Option<&str>,
+    ) -> WikiResult<String> {
         let budget = if max_chars == 0 {
             DEFAULT_COMPACT_INDEX_MAX_CHARS
         } else {
             max_chars
         };
         let conn = self.db.lock().unwrap();
-        generate_compact_index_md(&conn, &self.config, budget)
+        generate_compact_index_md_for_topic(&conn, &self.config, budget, preferred_topic)
+    }
+
+    /// Return all `<domain>/<topic>` folders under `wiki/sources/` that do not yet have a corresponding
+    /// synthesis page in `wiki/syntheses/`.
+    pub fn unsynthesized_topics(&self) -> WikiResult<Vec<String>> {
+        let conn = self.db.lock().unwrap();
+        find_unsynthesized_topics(&conn)
     }
 
     /// Rebuild and index `wiki/index.md` from all currently indexed wiki pages.
@@ -915,10 +939,12 @@ impl WikiEngine {
     /// Auto-Flow dispatcher prompt without relying on prior session conversation history:
     /// - If `sources/` is empty, returns `initial_collection_prompt`.
     /// - If `uningested_sources` exist in `sources/`, returns an `[AUTO-FLOW: NEW SOURCES DETECTED]`
-    ///   prompt listing the uningested paths alongside the compact `wiki/index.md`.
-    /// - If `wiki_lint` reports `broken_links` or `orphan_wiki_pages`, returns an `[AUTO-FLOW: WIKI LINT]`
+    ///   prompt listing the uningested paths alongside a topic-prioritized compact `wiki/index.md`.
+    /// - If any topic folder in `wiki/sources/` lacks a synthesis page in `wiki/syntheses/` OR
+    ///   `wiki_lint` reports `broken_links` / `orphan_wiki_pages`, returns an `[AUTO-FLOW: WIKI LINT]`
     ///   prompt for `wiki_curator`.
-    /// - If the vault is fully ingested and healthy (`is_healthy: true`), returns `Ok(None)`.
+    /// - If the vault is fully ingested, synthesized across all topics, and healthy (`is_healthy: true`),
+    ///   returns `Ok(None)`.
     pub fn build_next_autoflow_prompt(
         &self,
         initial_collection_prompt: Option<&str>,
@@ -930,9 +956,16 @@ impl WikiEngine {
         }
 
         let lint = self.lint_wiki()?;
-        let compact_index = self.read_compact_index_md(2_500).unwrap_or_default();
 
         if !lint.uningested_sources.is_empty() {
+            let first_rel = lint.uningested_sources[0]
+                .source_rel_path
+                .trim_start_matches("sources/");
+            let preferred_topic = extract_topic_from_doc(first_rel, "source_summary", None);
+            let compact_index = self
+                .read_compact_index_md_for_topic(2_500, preferred_topic.as_deref())
+                .unwrap_or_default();
+
             let new_sources_list = lint
                 .uningested_sources
                 .iter()
@@ -944,20 +977,29 @@ impl WikiEngine {
                  Hệ thống phát hiện {} tài liệu mới trong `sources/` chưa được ingest vào `wiki/`:\n{}\n\n\
                  === CURRENT COMPACT WIKI INDEX ===\n{}\n\
                  ==================================\n\n\
-                 Hãy điều phối subagent `wiki_ingestor` (gọi tuần tự từng file một) để ingest toàn bộ các file mới này vào `wiki/`, sau đó gọi `wiki_curator` để tổng hợp Synthesis và chạy `wiki_lint`.",
+                 Hãy điều phối subagent `wiki_ingestor` (gọi tuần tự từng file một) để ingest toàn bộ các file mới này vào `wiki/`, sau đó gọi `wiki_curator` để tổng hợp Synthesis theo từng chủ đề và chạy `wiki_lint`.",
                 lint.uningested_sources.len(),
                 new_sources_list,
                 compact_index.trim()
             )));
         }
 
-        if !lint.is_healthy {
+        let unsynthesized = self.unsynthesized_topics().unwrap_or_default();
+        if !unsynthesized.is_empty() || !lint.is_healthy {
+            let preferred_topic = unsynthesized.first().map(String::as_str);
+            let compact_index = self
+                .read_compact_index_md_for_topic(2_500, preferred_topic)
+                .unwrap_or_default();
+
             return Ok(Some(format!(
                 "[AUTO-FLOW: WIKI LINT]\n\
-                 `wiki_lint` phát hiện `broken_links={:?}` và `orphan_wiki_pages={:?}`.\n\n\
+                 Trạng thái Wiki hiện tại: `unsynthesized_topics={:?}`, `broken_links={:?}`, `orphan_wiki_pages={:?}`.\n\n\
                  === CURRENT COMPACT WIKI INDEX ===\n{}\n\
                  ==================================\n\n\
-                 Hãy điều phối subagent `wiki_curator` để sửa toàn bộ liên kết gãy/trang mồ côi và đảm bảo `is_healthy: true`.",
+                 Hãy điều phối subagent `wiki_curator` để:\n\
+                 1. Nếu `unsynthesized_topics` không rỗng: tạo trang tổng hợp `wiki/syntheses/<topic-slug>-synthesis.md` cho từng chủ đề trong `unsynthesized_topics` và gắn link hai chiều từ các trang `wiki/sources/<domain>/<topic>/...`.\n\
+                 2. Sửa toàn bộ `broken_links` và `orphan_wiki_pages`, sau đó chạy `wiki_lint` đảm bảo `is_healthy: true`.",
+                unsynthesized,
                 lint.broken_links,
                 lint.orphan_wiki_pages,
                 compact_index.trim()

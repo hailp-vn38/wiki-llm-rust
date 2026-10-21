@@ -174,6 +174,42 @@ fn resolve_target_against_candidates<'a>(
             });
             return path_matches.first().copied();
         }
+
+        // 1b. Domain-scoped category resolution (`entities/<domain>/<slug>.md`, `concepts/<domain>/<slug>.md`, `syntheses/<domain>/<slug>.md`)
+        // Allows `[[entities/slug]]` or `[[entities/other-domain/slug]]` to resolve to `wiki/entities/<domain>/slug.md` (or `wiki/entities/shared/slug.md`).
+        let without_wiki = spec_lower.strip_prefix("wiki/").unwrap_or(&spec_lower);
+        for cat_prefix in ["entities/", "concepts/", "syntheses/"] {
+            if without_wiki.starts_with(cat_prefix) {
+                let leaf = without_wiki.rsplit('/').next().unwrap_or(without_wiki);
+                let leaf_stem = leaf.strip_suffix(".md").unwrap_or(leaf);
+                if !leaf_stem.is_empty() {
+                    let mut cat_matches: Vec<&DocCandidate> = candidates
+                        .iter()
+                        .filter(|c| {
+                            c.collection == "wiki"
+                                && c.scoped_path.to_ascii_lowercase().starts_with(cat_prefix)
+                                && (c.file_stem_lower == leaf_stem
+                                    || c.file_name_lower == leaf
+                                    || c.aliases_lower
+                                        .iter()
+                                        .any(|a| a == leaf_stem || a == leaf))
+                        })
+                        .collect();
+                    if !cat_matches.is_empty() {
+                        cat_matches.sort_by(|a, b| {
+                            let a_exact_stem = a.file_stem_lower == leaf_stem;
+                            let b_exact_stem = b.file_stem_lower == leaf_stem;
+                            b_exact_stem
+                                .cmp(&a_exact_stem)
+                                .then_with(|| a.rel_path.len().cmp(&b.rel_path.len()))
+                                .then_with(|| a.rel_path.cmp(&b.rel_path))
+                        });
+                        return cat_matches.first().copied();
+                    }
+                }
+                break;
+            }
+        }
     }
 
     // 2. Match by `file_stem`, `file_name`, or `aliases` (Obsidian short wikilink `[[name]]`)

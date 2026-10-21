@@ -1,5 +1,7 @@
 use crate::db::filter_sql::resolve_matching_document_ids;
-use crate::db::index_store::{get_document_info_by_id, resolve_path_context_for_doc};
+use crate::db::index_store::{
+    get_document_info_by_id, resolve_path_context_for_doc, resolve_wiki_links_for_doc,
+};
 use crate::error::WikiResult;
 use crate::search::{SearchOptions, SearchResultItem};
 use crate::types::CollectionScope;
@@ -38,12 +40,7 @@ pub fn search_fts_bm25(
     };
 
     let allowed_collections: HashSet<&str> = if opts.collections.is_empty() {
-        [
-            CollectionScope::Wiki.as_str(),
-            CollectionScope::Sources.as_str(),
-        ]
-        .into_iter()
-        .collect()
+        [CollectionScope::Wiki.as_str()].into_iter().collect()
     } else {
         opts.collections
             .iter()
@@ -98,6 +95,9 @@ pub fn search_fts_bm25(
 
         let (snippet, match_line) = extract_best_snippet(&raw_body, query, 3);
         let context = resolve_path_context_for_doc(conn, info.collection, &info.scoped_path)?;
+        let (outgoing_links, backlinks, unresolved_links) =
+            resolve_wiki_links_for_doc(conn, doc_id, &info.rel_path)?;
+        let is_wiki_linked = !outgoing_links.is_empty() || !backlinks.is_empty();
         let virtual_uri = format!("qmd://{}/{}", info.collection.as_str(), info.scoped_path);
 
         results.push(SearchResultItem {
@@ -112,6 +112,10 @@ pub fn search_fts_bm25(
             snippet,
             context,
             metadata: info.metadata,
+            is_wiki_linked,
+            outgoing_links,
+            backlinks,
+            unresolved_links,
             explain: None,
         });
 

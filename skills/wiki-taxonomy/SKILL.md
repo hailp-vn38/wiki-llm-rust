@@ -43,13 +43,13 @@ Before creating or linking any page:
    - When saving a new raw source (`wiki_write_file(scope="sources")` or `raw_source_content` in `wiki_ingest_source`), organize it under a `kebab-case` topic path derived from the source's primary subject (max 2 levels deep):
      - `sources/<domain>/<topic>/<filename>.md` $\rightarrow$ automatically mirrors to `wiki/sources/<domain>/<topic>/<filename>.md` (preserving the exact filename).
    - If a raw source is stored flat at `sources/<filename>.md` but belongs to a specific topic folder in the wiki, pass `target_wiki_path="sources/<domain>/<topic>/<filename>.md"` to `wiki_ingest_source`.
-3. **Topic Subfolders for Entities, Concepts & Syntheses**:
-   - **Small / Medium Wikis (< 50 pages)**: Prefer flat `wiki/entities/<slug>.md` and `wiki/concepts/<slug>.md` so canonical slugs stay simple and unambiguous.
-   - **Large / Multi-Domain Wikis or Schema-Driven Topic Routing**: Group pages into topic subfolders (`kebab-case`, max 1–2 levels under the category folder) when `SCHEMA.md` or user instructions call for topic folders:
-     - `wiki/entities/<topic>/<slug>.md` (e.g., `wiki/entities/trading-platforms/metatrader-5.md`)
-     - `wiki/concepts/<topic>/<slug>.md` (e.g., `wiki/concepts/risk-management/dca-strategy.md`)
-     - `wiki/syntheses/<topic>/<slug>.md` (e.g., `wiki/syntheses/algo-trading/martingale-vs-grid.md`)
-   - Always link using the full wiki-scoped path in Obsidian `[[WikiLink]]` syntax (e.g., `[[concepts/risk-management/dca-strategy|DCA Strategy]]`).
+3. **Domain Subfolders for Entities, Concepts & Syntheses (Asymmetric Hierarchy + Global Unique Slug)**:
+   - **Asymmetric Folder Structure for Scalability (1,000+ files)**:
+     - `sources/<domain>/<topic>/<filename>.md` & `wiki/sources/<domain>/<topic>/<filename>.md`: 2 levels (`<domain>/<topic>`).
+     - `wiki/concepts/<domain>/<slug>.md`: 1 level by `<domain>` (e.g., `wiki/concepts/quantitative-finance/rate-gap-analysis.md`, `wiki/concepts/ai-engineering/reciprocal-rank-fusion.md`) so subtopics in the same domain share concepts without duplication.
+     - `wiki/entities/<domain>/<slug>.md` or `wiki/entities/shared/<slug>.md`: 1 level by `<domain>` for domain-specific entities (e.g., `wiki/entities/quantitative-finance/aiv-bank.md`), or `wiki/entities/shared/<slug>.md` for cross-domain tools/languages/libraries (e.g., `sqlite`, `python`, `rust`, `anydoc`).
+     - `wiki/syntheses/<domain>/<topic-slug>-synthesis.md`: 1 level by `<domain>`.
+   - **Global Unique Slug Rule**: Every `<slug>` must be unique across all `entities/` and `concepts/`. When `domain` is set in YAML frontmatter, `WikiEngine` automatically routes new pages to `<category>/<domain>/<slug>.md`, redirects writes/patches of existing slugs to their existing canonical path, and heals `[[entities/...]]` / `[[concepts/...]]` / `[[syntheses/...]]` links on disk to match.
 
 ## 5. Topic-Based Hierarchical Tagging Standard (Obsidian + QMD Filter)
 Every time you ingest or update a page from a source, extract **3 facets of `kebab-case` tags** directly from the source's subject matter and write them into both top-level `tags` (for Obsidian's nested tag tree) and `qmd.metadata` (for QMD hybrid search filtering):
@@ -93,5 +93,5 @@ Every time you ingest or update a page from a source, extract **3 facets of `keb
          - "atr-indicator"
    ---
    ```
-5. **Always Use Obsidian `[[WikiLink]]` Syntax in Body**:
-   - Use `[[entities/slug|Label]]`, `[[concepts/slug|Label]]`, `[[wiki/sources/...|Label]]` in the Markdown body — never use standard Markdown links `[label](path.md)` for internal wiki references.
+5. **Always Use Raw Obsidian `[[WikiLink]]` Syntax in Body (NEVER Wrap in Backticks)**:
+   - Use raw `[[entities/slug|Label]]`, `[[concepts/slug|Label]]`, `[[wiki/sources/...|Label]]` in the Markdown body — NEVER wrap `[[WikiLinks]]` inside single backticks (do NOT write `` `[[entities/slug]]` ``) because backticks turn links into dead inline code boxes in Obsidian, and never use standard Markdown links `[label](path.md)` for internal wiki references.

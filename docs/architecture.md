@@ -726,13 +726,15 @@ impl WikiEngine {
     /// Chạy tạo Vector Embeddings cho các chunks đang có `needs_embedding = 1`.
     pub fn embed_pending(&self, force_all: bool) -> Result<EmbedStats, WikiError>;
 
-    /// Tìm kiếm từ khóa nhanh bằng BM25 (SQLite FTS5).
+    /// Tìm kiếm từ khóa nhanh bằng BM25 (SQLite FTS5). Mặc định `collections = ["wiki"]`.
     pub fn search_lex(&self, query: &str, opts: SearchOptions) -> Result<Vec<SearchResultItem>, WikiError>;
 
-    /// Tìm kiếm ngữ nghĩa bằng Vector Similarity.
+    /// Tìm kiếm ngữ nghĩa bằng Vector Similarity. Mặc định `collections = ["wiki"]`.
     pub fn search_vec(&self, query: &str, opts: SearchOptions) -> Result<Vec<SearchResultItem>, WikiError>;
 
     /// Tìm kiếm Hybrid chuẩn QMD: Sub-queries (`lex`/`vec`/`hyde`) + RRF Fusion (k=60) + Reranking.
+    /// Mặc định `collections = ["wiki"]`. Mỗi `SearchResultItem` đính kèm sẵn mối liên hệ `[[WikiLinks]]`:
+    /// `is_wiki_linked`, `outgoing_links`, `backlinks`, và `unresolved_links`.
     pub fn query(&self, req: HybridQueryRequest) -> Result<Vec<SearchResultItem>, WikiError>;
 
     /// Quản lý Context Tree của QMD (gắn mô tả ngữ cảnh cho từng nhánh thư mục).
@@ -936,7 +938,8 @@ let tool_output = engine.execute_llm_tool(&call.name, call.arguments)?;
       "collections": {
         "type": "array",
         "items": { "type": "string", "enum": ["wiki", "sources"] },
-        "description": "Restrict search to specific collections (defaults to both 'wiki' and 'sources')."
+        "default": ["wiki"],
+        "description": "Restrict search to specific collections (defaults to ['wiki']; pass ['wiki', 'sources'] or ['sources'] to include raw sources)."
       },
       "filter": {
         "type": "object",

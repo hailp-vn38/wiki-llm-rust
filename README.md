@@ -7,6 +7,7 @@ Thư viện Rust local-first kết hợp kiến trúc **LLM Wiki** của Andrej 
 1. **Logic xử lý & tìm kiếm QMD**:
    - **Smart Markdown Chunking**: Cắt chunk (~900 tokens, 15% overlap) theo điểm ngắt ngữ nghĩa (Heading H1–H6, Code Fence Protection chống đứt khối code ` ``` `, Horizontal Rule, Paragraph) kèm công thức suy giảm khoảng cách bình phương.
    - **Hybrid Search Pipeline**: Kết hợp **SQLite FTS5 (BM25)** + **Vector Search** (`vec_cosine_distance`) + **Reciprocal Rank Fusion (RRF, $k=60$)** (trọng số $2\times$ cho truy vấn đầu, thưởng hạng Top-1 $+0.05$, Top-2/3 $+0.02$) + **Position-Aware Reranker Blending**.
+   - **Mặc định tìm trên `wiki` & Trả về mối liên hệ `[[WikiLinks]]`**: Mặc định `query` / `wiki_query` tìm kiếm trên `collections: ["wiki"]` (có thể truyền `["sources"]` hoặc `["wiki", "sources"]` khi cần tìm trong raw sources). Mỗi `SearchResultItem` trả về kèm sẵn trạng thái liên kết đồ thị (`is_wiki_linked`, `outgoing_links`, `backlinks`, `unresolved_links`).
    - **Metadata AST Filtering & Discovery**: Đánh chỉ mục YAML frontmatter và lọc đệ quy theo biểu thức logic (`and`, `or`, `not`, `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `nin`, `all`, `contains`, `prefix`, `suffix`, `exists`, `type`).
 2. **Tương thích Obsidian's Graph View**:
    - Thư mục dữ liệu gốc (`data_root`) mở trực tiếp được bằng **Obsidian** như một Vault hoàn chỉnh (tự động tạo `.obsidian/graph.json` phân màu cho `sources`, `wiki/sources`, `wiki/entities`, `wiki/concepts`, `wiki/syntheses`).
@@ -37,9 +38,15 @@ cargo run --example full_workflow
 # Chạy ví dụ Live YouTube Playlist -> Raw Source Markdown -> Karpathy LLM Wiki (dùng orchestrator-agent)
 cp .env.live.example .env.live   # điền G0_OPENAI_BASE_URL, G0_OPENAI_MODEL, G0_OPENAI_API_KEY
 cargo run --example youtube_playlist_wiki -- "<PLAYLIST_URL>" --limit 3 --lang en,vi
+
+# Chạy ví dụ PDF / Tài liệu -> anydoc (GFM Markdown) -> Multi-Subagent -> Karpathy LLM Wiki
+cargo run --example pdf_anydoc_wiki -- "<PDF_PATH>" --max-chars 60000
+# Hoặc chạy thử ngay với file PDF kỹ thuật mẫu tự sinh:
+cargo run --example pdf_anydoc_wiki -- --sample-pdf
 ```
 
 Xem chi tiết thiết kế kiến trúc và luồng xử lý tại:
 - [ARCHITECTURE.md](./ARCHITECTURE.md) — Đặc tả kỹ thuật, SQLite schema, thuật toán QMD & Rust API.
 - [docs/karpathy-llm-wiki.md](./docs/karpathy-llm-wiki.md) — Nguyên bản ý tưởng "LLM Wiki" của Andrej Karpathy và bảng ánh xạ vào `llm-wiki-rs`.
-- [examples/youtube_playlist_wiki/](./examples/youtube_playlist_wiki/main.rs) — Ứng dụng mẫu tích hợp [`orchestrator-agent`](https://crates.io/crates/orchestrator-agent) để xử lý YouTube Playlist thành Raw Sources (`sources/youtube/`) và tự động tổng hợp, liên kết chéo `[[WikiLinks]]`, kiểm tra sức khỏe (`lint_wiki`) trong `wiki/`.
+- [examples/youtube_playlist_wiki/](./examples/youtube_playlist_wiki/main.rs) — Ứng dụng mẫu tích hợp [`orchestrator-agent`](https://crates.io/crates/orchestrator-agent) để xử lý YouTube Playlist thành Raw Sources (`sources/<domain>/<topic>/`) và tự động tổng hợp, liên kết chéo `[[WikiLinks]]`, kiểm tra sức khỏe (`lint_wiki`) trong `wiki/`.
+- [examples/pdf_anydoc_wiki/](./examples/pdf_anydoc_wiki/main.rs) — Ứng dụng mẫu dùng [`anydoc`](https://crates.io/crates/anydoc) để chuyển đổi file PDF (hoặc DOCX/EPUB/PPTX/XLSX) sang GitHub-Flavored Markdown, phân loại vào `sources/<domain>/<topic>/` và điều phối Multi-Subagent biên dịch sang `wiki/`.

@@ -39,30 +39,26 @@ pub const ROOT_DISPATCHER_PROMPT: &str = r#"You are the Root Subagent Dispatcher
 "#;
 
 /// System prompt for Subagent 1 (`source_collector`): Collects detailed source material and organizes it into `sources/<domain>/<topic>/`.
-pub const SOURCE_COLLECTOR_PROMPT: &str = r#"You are the `source_collector` Subagent — a specialist in extracting detailed source material and organizing it into `sources/` by topic folder and hierarchical tags.
+pub const SOURCE_COLLECTOR_PROMPT: &str = r#"You are the `source_collector` Subagent — a specialist in extracting detailed source material (from YouTube playlists, PDF/Office documents via `anydoc`, or external files) and organizing it into `sources/<domain>/<topic>/` with hierarchical tags.
 
 Follow these steps autonomously:
 
 1. **Load Taxonomy Skill & Inspect Existing Source Tree**:
    - Call `skill` with `id="wiki-taxonomy"`.
-   - Call `wiki_tree` with `scope="sources"` to see if any topic folders already exist.
+   - Call `wiki_tree` with `scope="sources"` to see if any `<domain>/<topic>` folders already exist.
 
-2. **List the Playlist & Analyze Topic Hierarchy**:
-   - Call `yt_list_playlist` with the playlist URL.
-   - Examine the video titles and overall subject matter of the playlist.
-   - Determine a clean, descriptive `kebab-case` topic folder path `<domain>/<topic>` (max 2 levels deep, e.g., `algo-trading/mql5-dca`, `ai-engineering/llm-agents`, `quantitative-finance/risk-management`). If a matching folder already exists in `sources/`, reuse it.
-   - Determine 3–5 hierarchical topic tags in `kebab-case` (e.g., `["topic/<domain>/<topic>", "<key-tech-1>", "<key-tech-2>"]`).
+2. **Inspect the Input Source(s) & Determine Topic Hierarchy (`<domain>/<topic>`)**:
+   - **If given a YouTube Playlist URL**:
+     - Call `yt_list_playlist` with the playlist URL.
+     - Examine the video titles and subject matter. If all videos share one theme, choose a single `kebab-case` `<domain>/<topic>` folder; if the playlist spans multiple distinct subjects, assign the matching `<domain>/<topic>` folder to each video (reusing existing folders in `sources/` when applicable).
+     - For EVERY video returned by `yt_list_playlist`, call `yt_fetch_transcript` with `video_id`, `topic_folder` (`<domain>/<topic>`), `title`, and 3–5 hierarchical `tags` (`["topic/<domain>/<topic>", ...]`).
+   - **If given PDF / Document path(s) (with `anydoc` tools)**:
+     - Call `anydoc_inspect_pdf` to extract the document metadata, heading outline, and Markdown preview via `anydoc`.
+     - Determine the appropriate `kebab-case` `<domain>/<topic>` folder path (max 2 levels deep, e.g., `quantitative-finance/deep-learning`, `ai-engineering/llm-agents`, `software-architecture/rust-systems`) and 3–5 hierarchical tags (`["topic/<domain>/<topic>", ...]`).
+     - Call `anydoc_save_to_sources` for each document (or section) to save the converted Markdown into `sources/<domain>/<topic>/<file_stem>.md`.
 
-3. **Fetch Detailed Transcripts & Save Each Video into `sources/<domain>/<topic>/` by Topic**:
-   - For EVERY video returned by `yt_list_playlist`, call `yt_fetch_transcript` with:
-     - `video_id`: Exact `video_id` from `yt_list_playlist`
-     - `topic_folder`: Your chosen `<domain>/<topic>` folder path
-     - `title`: Exact video title
-     - `tags`: Your hierarchical topic tags for that video
-   - Wait for all videos in the playlist to be saved into `sources/<domain>/<topic>/<stem>.md`.
-
-4. **Return Structured Summary to Root**:
-   - Reply with the chosen `topic_folder`, the hierarchical tags used, and the exact list of `SOURCE_SCOPED_PATH` values created in `sources/` so the next flow can ingest them.
+3. **Return Structured Summary to Root**:
+   - Reply with the chosen `topic_folder`(s), the hierarchical tags used, and the exact list of `SOURCE_SCOPED_PATH` values created in `sources/` so the next flow can ingest them.
 "#;
 
 /// System prompt for Subagent 2 (`wiki_ingestor`): Compiles a single raw source file from `sources/` into `wiki/`.
@@ -101,31 +97,34 @@ Follow the universal skills (`wiki-taxonomy` and `wiki-ingest`) and the `javis-o
 
 4. **Create or Merge Entity & Concept Pages + Bidirectional Source Links (BATCH IN PARALLEL TO SAVE TOKENS)**:
    - **CRITICAL TOKEN-SAVING RULE**: Emit multiple `wiki_write_file` and `wiki_patch_file` tool calls **in parallel within the same assistant turn** (1–2 batched turns total) instead of calling 1 tool per turn! Every extra turn resends the entire conversation history and multiplies token consumption.
-   - For each slug in `related_entities` (`entities/<slug>.md`) and `related_concepts` (`concepts/<slug>.md`):
-     - If it **does not exist** in `wiki/index.md` yet: call `wiki_write_file(scope="wiki", rel_path="entities/<slug>.md" | "concepts/<slug>.md", content=...)` with full YAML frontmatter (`title`, `category`, `domain`, `topic`, `summary`, `aliases` (include abbreviations, English/Vietnamese synonyms, and auto-sub phonetic variants), `sources`, `tags`, `qmd.metadata`), opening with 1–2 self-contained positioning sentences (what it is, which domain it belongs to, when it is used), technical synthesis, and a link to `[[wiki/sources/<source_rel_path>|<Title>]]` and `[[sources/<source_rel_path>|<filename>]]`.
-     - If it **already exists** in `wiki/index.md`: do NOT call `wiki_get` on it; directly call `wiki_patch_file(scope="wiki", rel_path="entities/<slug>.md" | "concepts/<slug>.md", append_text="\n- [[wiki/sources/<source_rel_path>|<Title>]] (Nguồn: [[sources/<source_rel_path>|<filename>]]) — <1 câu tổng hợp đóng góp/chi tiết mới từ tài liệu này>\n")`.
+   - **CRITICAL OBSIDIAN LINK RULE**: In every `entities/*.md` and `concepts/*.md` page (especially in the `## Liên kết` section), write raw clickable Obsidian WikiLinks (`- **Entity**: [[entities/slug|Label]]`, `- **Source**: [[sources/...|File]]`), NEVER wrap `[[...]]` inside backticks (`` `[[...]]` ``)!
+   - For each slug in `related_entities` (`entities/<domain>/<slug>.md` or `entities/shared/<slug>.md`) and `related_concepts` (`concepts/<domain>/<slug>.md`):
+     - If it **does not exist** in `wiki/index.md` yet: call `wiki_write_file(scope="wiki", rel_path="entities/<domain>/<slug>.md" | "entities/shared/<slug>.md" | "concepts/<domain>/<slug>.md", content=...)` with full YAML frontmatter (`title`, `category`, `domain` (`"<domain>"` or `"shared"` for cross-domain tools), `topic`, `summary`, `aliases` (include abbreviations, English/Vietnamese synonyms, and auto-sub phonetic variants), `sources`, `tags`, `qmd.metadata`), opening with 1–2 self-contained positioning sentences (what it is, which domain it belongs to, when it is used), technical synthesis, and a link to `[[wiki/sources/<source_rel_path>|<Title>]]` and `[[sources/<source_rel_path>|<filename>]]`.
+     - If it **already exists** in `wiki/index.md`: do NOT call `wiki_get` on it; directly call `wiki_patch_file(scope="wiki", rel_path="<existing_path>.md", append_text="\n- [[wiki/sources/<source_rel_path>|<Title>]] (Nguồn: [[sources/<source_rel_path>|<filename>]]) — <1 câu tổng hợp đóng góp/chi tiết mới từ tài liệu này>\n")`.
    - For the 1–2 most closely related existing source pages in `wiki/sources/`: call `wiki_patch_file(scope="wiki", rel_path="sources/<existing_path>.md", append_text="\n- ↔ [[wiki/sources/<source_rel_path>|<Title>]] — <1 câu mô tả mối liên hệ>\n")`.
 
 5. Reply concisely with `INGESTED: wiki/sources/<source_rel_path>` and the list of created/updated entity and concept pages.
 "#;
 
 /// System prompt for Subagent 3 (`wiki_curator`): Cross-source synthesis (`wiki/syntheses/`) and `wiki_lint` health auditing.
-pub const WIKI_CURATOR_PROMPT: &str = r#"You are the `wiki_curator` Subagent — a specialist in cross-source synthesis (`wiki/syntheses/`) and wiki health auditing (`wiki_lint`).
+pub const WIKI_CURATOR_PROMPT: &str = r#"You are the `wiki_curator` Subagent — a specialist in per-topic cross-source synthesis (`wiki/syntheses/`) and wiki health auditing (`wiki_lint`).
 
 Follow these steps:
 
 1. **Load Skills & Inspect Wiki Index**:
    - Call `skill` with `id="wiki-lint"` and `skill` with `id="wiki-query"`.
-   - Call `wiki_get(file="wiki/index.md")` to inspect all ingested source pages (`wiki/sources/...`), `wiki/entities/...`, `wiki/concepts/...`, and `wiki/syntheses/...`.
+   - Call `wiki_get(file="wiki/index.md")` to inspect all ingested source pages (`wiki/sources/<domain>/<topic>/...`), `wiki/entities/...`, `wiki/concepts/...`, and `wiki/syntheses/...`.
 
-2. **Create Cross-Source Synthesis Page (if not yet created)**:
-   - If there are multiple ingested source pages in `wiki/sources/` and no synthesis page in `wiki/syntheses/` covers them yet:
-     - Call `wiki_file_synthesis` to create `syntheses/<topic-slug>-synthesis.md` in Vietnamese (60–100 lines) containing:
-       - Executive summary & progression across all ingested sources
-       - A Markdown comparison table linking to every `[[wiki/sources/...|Title]]` page
+2. **Create Per-Topic Synthesis Pages (`wiki/syntheses/`)**:
+   - Check each `<domain>/<topic>` folder in `wiki/sources/<domain>/<topic>/...` (especially any topic listed in `unsynthesized_topics`).
+   - For each `<domain>/<topic>` that does NOT yet have a corresponding synthesis page in `wiki/syntheses/`:
+     - Call `wiki_file_synthesis` to create `syntheses/<domain>/<topic-slug>-synthesis.md` in Vietnamese (60–100 lines) containing:
+       - Executive summary & progression across all ingested sources of that `<domain>/<topic>`
+       - A Markdown comparison/synthesis table linking to every `[[wiki/sources/<domain>/<topic>/...|Title]]` page in that topic
        - Links to core `[[entities/...]]` and `[[concepts/...]]` pages
        - A multi-line `flowchart LR` Mermaid diagram
-     - Call `wiki_patch_file(scope="wiki")` on the source pages in `sources/...` to append a link `- [[wiki/syntheses/<topic-slug>-synthesis|<Title>]]` so the synthesis page has inbound links (no orphan pages!).
+       - Tags including `"topic/<domain>/<topic>"`
+     - Call `wiki_patch_file(scope="wiki")` on the source pages in `sources/<domain>/<topic>/...` to append a link `- [[wiki/syntheses/<domain>/<topic-slug>-synthesis|<Title>]]` so the synthesis page has inbound links (no orphan pages!).
 
 3. **Run `wiki_lint` & Repair Loop**:
    - Call `wiki_lint`.
@@ -133,5 +132,5 @@ Follow these steps:
      - Fix every issue immediately using `wiki_patch_file`, `wiki_write_file`, or `wiki_delete_file`.
      - Re-run `wiki_lint` until `is_healthy: true`.
 
-4. Reply in Vietnamese summarizing the synthesis page and confirming `wiki_lint` health status.
+4. Reply in Vietnamese summarizing the synthesis page(s) and confirming `wiki_lint` health status.
 "#;

@@ -290,25 +290,105 @@ pub fn sanitize_topic_folder(raw: &str) -> String {
     }
 }
 
-/// Automatically replace malformed `</mermaid>` closing tags with standard CommonMark ```` ``` ```` fences.
+/// Automatically sanitize common LLM Markdown formatting defects for Obsidian compatibility:
+/// 1. Replace malformed `</mermaid>` closing tags with standard CommonMark ```` ``` ```` fences.
+/// 2. Unwrap single backticks around Obsidian WikiLinks (`` `[[target]]` `` -> `[[target]]` and
+///    `` `![[target]]` `` -> `![[target]]`) outside of fenced code blocks so Obsidian renders them
+///    as live clickable links and Graph View edges instead of dead inline code pills.
 pub fn sanitize_mermaid_fences(md: &str) -> String {
-    if !md.contains("</mermaid>") && !md.contains("</MERMAID>") {
+    let needs_mermaid_fix = md.contains("</mermaid>") || md.contains("</MERMAID>");
+    let needs_wikilink_unquote = md.contains("`[[") || md.contains("`![[");
+    if !needs_mermaid_fix && !needs_wikilink_unquote {
         return md.to_string();
     }
-    let mut out = md
-        .lines()
-        .map(|line| {
-            if line.trim().eq_ignore_ascii_case("</mermaid>") {
+
+    let mut in_code_fence = false;
+    let mut fence_marker = "";
+    let mut out_lines = Vec::new();
+
+    for line in md.lines() {
+        let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case("</mermaid>") {
+            in_code_fence = false;
+            fence_marker = "";
+            out_lines.push("```".to_string());
+            continue;
+        }
+
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            let marker = if trimmed.starts_with("```") {
                 "```"
             } else {
-                line
+                "~~~"
+            };
+            if !in_code_fence {
+                in_code_fence = true;
+                fence_marker = marker;
+            } else if trimmed.starts_with(fence_marker) {
+                in_code_fence = false;
+                fence_marker = "";
             }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+            out_lines.push(line.to_string());
+            continue;
+        }
+
+        if !in_code_fence && (line.contains("`[[") || line.contains("`![[")) {
+            out_lines.push(unwrap_backticked_wikilinks_on_line(line));
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+
+    let mut out = out_lines.join("\n");
     if md.ends_with('\n') && !out.ends_with('\n') {
         out.push('\n');
     }
+    out
+}
+
+fn unwrap_backticked_wikilinks_on_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+
+    while let Some(open_idx) = rest.find('`') {
+        out.push_str(&rest[..open_idx]);
+        let after_open = &rest[open_idx + 1..];
+
+        // Do not touch multi-backtick spans (``)
+        if after_open.starts_with('`') {
+            let ticks: String = rest[open_idx..]
+                .chars()
+                .take_while(|&c| c == '`')
+                .collect();
+            out.push_str(&ticks);
+            rest = &rest[open_idx + ticks.len()..];
+            continue;
+        }
+
+        if let Some(close_idx) = after_open.find('`') {
+            let inner = &after_open[..close_idx];
+            let trimmed_inner = inner.trim();
+            let is_pure_wikilink = (trimmed_inner.starts_with("[[")
+                || trimmed_inner.starts_with("![["))
+                && trimmed_inner.ends_with("]]")
+                && !trimmed_inner[..trimmed_inner.len() - 2].contains("]]");
+
+            if is_pure_wikilink {
+                out.push_str(trimmed_inner);
+            } else {
+                out.push('`');
+                out.push_str(inner);
+                out.push('`');
+            }
+            rest = &after_open[close_idx + 1..];
+        } else {
+            out.push_str(&rest[open_idx..]);
+            rest = "";
+            break;
+        }
+    }
+
+    out.push_str(rest);
     out
 }
 
@@ -385,4 +465,30 @@ pub fn clip_transcript(text: &str, max: usize) -> String {
         seg(mid),
         seg(chars.len() - part)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_unwraps_backtick_wikilinks_outside_code_fences() {
+        let input = "\
+## Liên kết
+
+- **Entity**: `[[entities/core-deposit]]`, `[[entities/core-deposit-renewal|Renewal]]`
+- **Concept**: `[[concepts/early-redemption]]` (bảng `core_deposit` giữ nguyên)
+- **Source**: `[[sources/data-science/banking-analytics/doc.md]]`
+
+```sql
+-- Inside fenced code block, keep `[[entities/core-deposit]]` intact
+SELECT * FROM `core_deposit`;
+```
+";
+        let sanitized = sanitize_mermaid_fences(input);
+        assert!(sanitized.contains("- **Entity**: [[entities/core-deposit]], [[entities/core-deposit-renewal|Renewal]]"));
+        assert!(sanitized.contains("- **Concept**: [[concepts/early-redemption]] (bảng `core_deposit` giữ nguyên)"));
+        assert!(sanitized.contains("- **Source**: [[sources/data-science/banking-analytics/doc.md]]"));
+        assert!(sanitized.contains("-- Inside fenced code block, keep `[[entities/core-deposit]]` intact"));
+    }
 }

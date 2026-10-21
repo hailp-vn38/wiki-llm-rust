@@ -35,7 +35,11 @@ pub fn execute_tool_call(engine: &WikiEngine, tool_name: &str, mut args: Value) 
             "markdown_body",
         ] {
             if let Some(Value::String(s)) = obj.get_mut(field) {
-                if s.contains("</mermaid>") {
+                if s.contains("</mermaid>")
+                    || s.contains("</MERMAID>")
+                    || s.contains("`[[")
+                    || s.contains("`![[")
+                {
                     *s = sanitize_mermaid_fences(s);
                 }
             }
@@ -97,7 +101,10 @@ pub fn execute_tool_call(engine: &WikiEngine, tool_name: &str, mut args: Value) 
                 })?,
                 _ => Vec::new(),
             };
-            let collections = parse_collections_arg(args.get("collections"));
+            let mut collections = parse_collections_arg(args.get("collections"));
+            if collections.is_empty() {
+                collections.push(CollectionScope::Wiki);
+            }
             let filter: Option<MetadataFilter> = match args.get("filter") {
                 Some(v) if !v.is_null() => {
                     Some(serde_json::from_value(v.clone()).map_err(|e| {
@@ -568,11 +575,20 @@ pub fn execute_tool_call_with_budget(
             || clean_file.eq_ignore_ascii_case("index.md"))
             && from_line.is_none()
         {
+            let preferred_topic = args
+                .get("topic")
+                .or_else(|| args.get("preferred_topic"))
+                .and_then(Value::as_str);
             let full_idx = engine.read_index_md()?;
-            let body = if full_idx.chars().count() <= read_budget.compact_index_max_chars {
+            let body = if preferred_topic.is_none()
+                && full_idx.chars().count() <= read_budget.compact_index_max_chars
+            {
                 full_idx
             } else {
-                engine.read_compact_index_md(read_budget.compact_index_max_chars)?
+                engine.read_compact_index_md_for_topic(
+                    read_budget.compact_index_max_chars,
+                    preferred_topic,
+                )?
             };
             return Ok(LlmToolOutcome {
                 content: format!("FILE: wiki/index.md\n\n{body}"),

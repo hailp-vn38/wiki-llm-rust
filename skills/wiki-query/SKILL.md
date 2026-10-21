@@ -12,6 +12,8 @@ Choose the right tool for the question:
 1. **Index-First Navigation (`wiki_get(file="wiki/index.md")`)**:
    - Inspect `wiki/index.md` first to see available `wiki/sources/`, `wiki/entities/`, `wiki/concepts/`, and `wiki/syntheses/` pages and their one-line summaries.
 2. **QMD Hybrid Search (`wiki_query`)**:
+   - Defaults to searching `collections: ["wiki"]` (pass `collections: ["sources"]` or `["wiki", "sources"]` when searching raw sources).
+   - Each result automatically includes resolved `[[WikiLinks]]` relationships (`is_wiki_linked`, `outgoing_links`, `backlinks`, and `unresolved_links`).
    - Use typed sub-queries for high-precision retrieval:
      - `lex`: BM25 exact keyword/identifier match (e.g., function names, error codes, metrics).
      - `vec`: Semantic similarity search.

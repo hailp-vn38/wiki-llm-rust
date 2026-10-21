@@ -56,7 +56,7 @@ pub fn build_llm_tool_definitions() -> Vec<LlmToolSpec> {
         },
         LlmToolSpec {
             name: "wiki_query".to_string(),
-            description: "Search across `wiki` and `sources` using QMD Hybrid Search (BM25 full-text + Vector semantic search + Reciprocal Rank Fusion + optional Reranking and recursive Metadata Filtering).".to_string(),
+            description: "Search across `wiki` (default) or `sources` using QMD Hybrid Search (BM25 full-text + Vector semantic search + Reciprocal Rank Fusion + optional Reranking and recursive Metadata Filtering). Returns ranked results with `[[WikiLinks]]` relationship details (`is_wiki_linked`, `outgoing_links`, `backlinks`, `unresolved_links`).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -79,7 +79,8 @@ pub fn build_llm_tool_definitions() -> Vec<LlmToolSpec> {
                     "collections": {
                         "type": "array",
                         "items": { "type": "string", "enum": ["wiki", "sources"] },
-                        "description": "Filter by collection names (defaults to searching both 'wiki' and 'sources')."
+                        "default": ["wiki"],
+                        "description": "Filter by collection names (defaults to ['wiki']; pass ['wiki', 'sources'] or ['sources'] to include raw sources)."
                     },
                     "filter": {
                         "type": "object",
