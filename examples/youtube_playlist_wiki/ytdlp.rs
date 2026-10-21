@@ -80,7 +80,25 @@ pub(crate) fn vtt_to_text(vtt: &str) -> String {
             out.push(text);
         }
     }
-    out.join(" ")
+    // Gom các cue phụ đề thành các dòng văn bản dài ~120–140 ký tự (giống chuẩn đọc theo dòng `doc_theo_dong` của javis-os)
+    // để agent có thể đọc phân trang bằng `from_line` / `max_lines` thay vì dồn toàn bộ transcript vào 1 dòng khổng lồ.
+    let mut lines: Vec<String> = Vec::new();
+    let mut current_line = String::new();
+    for cue in out {
+        if current_line.is_empty() {
+            current_line.push_str(&cue);
+        } else if current_line.chars().count() + 1 + cue.chars().count() <= 130 {
+            current_line.push(' ');
+            current_line.push_str(&cue);
+        } else {
+            lines.push(std::mem::take(&mut current_line));
+            current_line.push_str(&cue);
+        }
+    }
+    if !current_line.is_empty() {
+        lines.push(current_line);
+    }
+    lines.join("\n")
 }
 
 pub(crate) fn clip_transcript(text: &str, max: usize) -> String {

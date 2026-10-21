@@ -733,32 +733,91 @@ fn find_document_id_flexible(conn: &Connection, target: &str) -> WikiResult<Opti
         return Ok(Some(id));
     }
 
+    // 4. Match on `aliases_json` (inspired by `javis-os` `_wiki_trung` alias lookup)
+    let stem_target = target
+        .strip_suffix(".md")
+        .unwrap_or(target)
+        .trim()
+        .to_ascii_lowercase();
+    if !stem_target.is_empty() {
+        let mut stmt = conn.prepare(
+            "SELECT id, aliases_json FROM documents
+             ORDER BY CASE WHEN collection = 'wiki' THEN 0 ELSE 1 END, length(rel_path) ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, aliases_json) = row?;
+            let aliases: Vec<String> = serde_json::from_str(&aliases_json).unwrap_or_default();
+            if aliases
+                .iter()
+                .any(|a| a.trim().eq_ignore_ascii_case(&stem_target))
+            {
+                return Ok(Some(id));
+            }
+        }
+    }
+
     Ok(None)
+}
+
+fn extract_numbers(s: &str) -> Vec<String> {
+    let mut nums = Vec::new();
+    let mut cur = String::new();
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            nums.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        nums.push(cur);
+    }
+    nums
 }
 
 fn find_similar_files(conn: &Connection, query: &str, limit: usize) -> WikiResult<Vec<String>> {
     let q_lower = query.to_ascii_lowercase();
-    let mut stmt = conn.prepare("SELECT rel_path, file_stem, title FROM documents")?;
+    let q_nums = extract_numbers(&q_lower);
+    let mut stmt =
+        conn.prepare("SELECT rel_path, file_stem, title, aliases_json FROM documents")?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
         ))
     })?;
 
     let mut scored: Vec<(usize, String)> = Vec::new();
     for row in rows {
-        let (rel_path, stem, title) = row?;
+        let (rel_path, stem, title, aliases_json) = row?;
         let rel_l = rel_path.to_ascii_lowercase();
         let stem_l = stem.to_ascii_lowercase();
         let title_l = title.to_ascii_lowercase();
+        let aliases: Vec<String> = serde_json::from_str(&aliases_json).unwrap_or_default();
 
-        let score = if rel_l.contains(&q_lower) || q_lower.contains(&stem_l) {
+        // Number-guard from `javis-os` `_wiki_trung`: if both strings contain numbers and they differ
+        // (e.g., "IFRS 7" vs "IFRS 9", or "01-video" vs "02-video"), penalize fuzzy similarity heavily.
+        let cand_nums = extract_numbers(&stem_l);
+        let number_mismatch =
+            !q_nums.is_empty() && !cand_nums.is_empty() && q_nums != cand_nums;
+
+        let alias_match = aliases
+            .iter()
+            .any(|a| a.to_ascii_lowercase().contains(&q_lower));
+
+        let mut score = if rel_l.contains(&q_lower) || q_lower.contains(&stem_l) || alias_match {
             100
         } else {
             common_char_score(&q_lower, &stem_l).max(common_char_score(&q_lower, &title_l))
         };
+        if number_mismatch {
+            score /= 3;
+        }
         if score > 20 {
             scored.push((score, rel_path));
         }

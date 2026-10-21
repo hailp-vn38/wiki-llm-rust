@@ -1,24 +1,18 @@
-//! App Example (100% Agent-Driven + Skills):
-//! Live YouTube Playlist -> Raw Source Markdown -> Karpathy LLM Wiki
-//! sử dụng `orchestrator-agent` (`orchestrator_agent_rs`) + `llm-wiki` (`WikiEngine`).
+//! App Example (Multi-Subagent + Reactive Auto-Ingest Flow + Universal Skills):
 //!
-//! Điểm cốt lõi của thiết kế nâng cấp:
-//! 1. **100% do Agent tự xử lý toàn bộ Flow (Host KHÔNG làm thay)**:
-//!    - Host chỉ đăng ký các tool nguyên bản:
-//!      - `yt_list_playlist`: Lấy danh sách video từ URL playlist bằng `yt-dlp`.
-//!      - `yt_fetch_transcript`: Agent tự gọi để tải phụ đề `.vtt` bằng `yt-dlp`, tạo file
-//!        Raw Source bất biến tại `sources/youtube/<slug>.md` và nhận toàn bộ nội dung transcript.
-//!      - Bộ tool nguyên bản của `WikiEngine` (`wiki_tree`, `wiki_get`, `wiki_multi_get`,
-//!        `wiki_query`, `wiki_ingest_source`, `wiki_write_file`, `wiki_patch_file`,
-//!        `wiki_delete_file`, `wiki_file_synthesis`, `wiki_lint`, `wiki_status`, `wiki_log`).
-//! 2. **Tích hợp hệ thống Skills (`skills/<id>/SKILL.md`) của `orchestrator-agent`**:
-//!    - `karpathy-wiki-taxonomy`: Quy hoạch bộ khung Taxonomy chuẩn (Canonical Entities & Concepts)
-//!      chống phân mảnh/trùng lặp tên file, phân tách rõ `entities/` và `concepts/`.
-//!    - `deep-video-wiki-ingest`: Hướng dẫn Agent khai thác sâu toàn bộ transcript (thông số kỹ thuật,
-//!      logic code/thuật toán, kịch bản backtest, mâu thuẫn `[!WARNING] Contradiction`, sơ đồ Mermaid)
-//!      và **tự động liên kết tới các trang video đã có sẵn trong Wiki**.
-//!    - `karpathy-wiki-synthesis-lint`: Hướng dẫn Agent tổng hợp bảng đối chiếu xuyên suốt Playlist,
-//!      lưu vào `wiki/syntheses/`, và tự chạy `wiki_lint` + sửa lỗi cho tới khi `is_healthy = true`.
+//! Luồng thực thi hoàn toàn tự động theo 3 nguyên tắc:
+//! 1. **Thu thập Source theo chủ đề (`source_collector`)**:
+//!    - Khi nhận yêu cầu *"Hãy lấy thông tin chi tiết trong playlist và lưu vào source theo chủ đề"*,
+//!      Subagent `source_collector` lấy thông tin + transcript từng video và tự động phân loại
+//!      vào thư mục chủ đề `sources/<domain>/<topic>/<slug>.md` kèm bộ tag phân cấp.
+//! 2. **Tự động kích hoạt Ingest khi có tài liệu mới trong `sources/` (`wiki_ingestor` & `wiki_curator`)**:
+//!    - Ngay khi có file mới xuất hiện trong `sources/`, luồng Auto-Flow tự động kích hoạt
+//!      Subagent `wiki_ingestor` (dùng skill `wiki-taxonomy` + `wiki-ingest`) để biên dịch sang `wiki/`
+//!      và Subagent `wiki_curator` (dùng skill `wiki-query` + `wiki-lint`) để tổng hợp & kiểm toán.
+//!    - Không dùng bất kỳ prompt cố định theo bài toán cụ thể nào.
+//! 3. **Root Agent chỉ điều phối (`allowed_tools = ["subagent"]`)**:
+//!    - Root Agent (`root`) không có bất kỳ tool xử lý trực tiếp nào, toàn bộ công việc
+//!      do 3 Subagent chuyên biệt (`source_collector`, `wiki_ingestor`, `wiki_curator`) thực hiện.
 
 mod prompts;
 mod runner;
@@ -30,16 +24,20 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use llm_wiki::prompts::{get_wiki_template, WikiTemplateId};
 use llm_wiki::{CollectionScope, WikiEngine};
 use orchestrator_agent_rs::{
     AgentDefinition, AgentMode, LlmBackend, LlmConfig, LlmProviderConfig, Orchestrator,
     OrchestratorConfig, ProviderAuth, SecretString, ToolEffect,
 };
 
-use prompts::{COORDINATOR_PROMPT, VIDEO_INGESTOR_PROMPT, YOUTUBE_WIKI_SCHEMA_MD};
+use prompts::{
+    ROOT_DISPATCHER_PROMPT, SOURCE_COLLECTOR_PROMPT, WIKI_CURATOR_PROMPT, WIKI_INGESTOR_PROMPT,
+};
 use runner::{resolve_llm_credentials, run_orchestrator_turn, verify_vault_on_disk};
 use tools::{
-    SharedEnv, WikiDeleteFileTool, WikiEngineBridgeTool, YtFetchTranscriptTool, YtListPlaylistTool,
+    AdaptiveReadBudget, SharedEnv, WikiDeleteFileTool, WikiEngineBridgeTool, YtFetchTranscriptTool,
+    YtListPlaylistTool,
 };
 
 pub(crate) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -50,6 +48,7 @@ async fn main() -> Result<()> {
     let mut url: Option<String> = None;
     let mut langs = "en,vi".to_string();
     let mut limit = usize::MAX;
+    let mut model_override: Option<String> = None;
     let mut env_file = std::env::var_os("LIVE_ENV_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| manifest_dir.join(".env.live"));
@@ -58,7 +57,7 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--lang" | "--env-file" | "--vault-dir" | "--output-dir" | "--limit" => {
+            "--lang" | "--env-file" | "--vault-dir" | "--output-dir" | "--limit" | "--model" => {
                 let v = args
                     .next()
                     .ok_or_else(|| io::Error::other(format!("Thiếu giá trị cho {arg}")))?;
@@ -66,12 +65,13 @@ async fn main() -> Result<()> {
                     "--lang" => langs = v,
                     "--env-file" => env_file = PathBuf::from(v),
                     "--limit" => limit = v.parse()?,
+                    "--model" => model_override = Some(v),
                     _ => output_root = PathBuf::from(v),
                 }
             }
             "--help" | "-h" => {
                 println!(
-                    "Cách dùng:\n  cargo run --example youtube_playlist_wiki -- <PLAYLIST_URL> [--lang en,vi] [--limit N] [--env-file .env.live] [--vault-dir target/youtube-wiki-vault]"
+                    "Cách dùng:\n  cargo run --example youtube_playlist_wiki -- <PLAYLIST_URL> [--model <MODEL>] [--lang en,vi] [--limit N] [--env-file .env.live] [--vault-dir target/youtube-wiki-vault]"
                 );
                 return Ok(());
             }
@@ -86,7 +86,8 @@ async fn main() -> Result<()> {
 
     let playlist_url =
         url.ok_or_else(|| io::Error::other("Thiếu <PLAYLIST_URL>; dùng --help để xem hướng dẫn"))?;
-    let (endpoint, model, api_key) = resolve_llm_credentials(&env_file)?;
+    let (endpoint, env_model, api_key) = resolve_llm_credentials(&env_file)?;
+    let model = model_override.unwrap_or(env_model);
 
     let run_id = &uuid::Uuid::new_v4().to_string()[..8];
     let run_dir = output_root.join(format!("run-{run_id}"));
@@ -98,46 +99,51 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&prompts_dir)?;
     std::fs::create_dir_all(&work_dir)?;
 
-    // 1. Khởi tạo `WikiEngine`
+    // 1. Khởi tạo `WikiEngine` với chuẩn Universal Template (`WikiTemplateId::Research`)
     let engine = Arc::new(WikiEngine::open(&vault_dir)?);
-    engine.set_schema_md(YOUTUBE_WIKI_SCHEMA_MD)?;
+    let template = get_wiki_template(WikiTemplateId::Research);
+    engine.set_schema_md(&template.schema_md)?;
     engine.set_path_context(
         Some(CollectionScope::Sources),
-        "/youtube",
-        "Raw immutable YouTube video transcripts fetched via yt-dlp",
+        "/",
+        "Raw immutable source documents organized by topic folder (<domain>/<topic>)",
     )?;
     engine.set_path_context(
         Some(CollectionScope::Wiki),
-        "/sources/youtube",
-        "Deep technical LLM-compiled video wiki pages preserving raw source filenames",
+        "/sources",
+        "Compiled source summary wiki pages preserving raw source filenames and topic folders",
     )?;
     engine.set_path_context(
         Some(CollectionScope::Wiki),
         "/entities",
-        "Canonical entity pages (people, platforms, languages, indicators, datasets)",
+        "Canonical entity pages (people, platforms, languages, tools, datasets)",
     )?;
     engine.set_path_context(
         Some(CollectionScope::Wiki),
         "/concepts",
-        "Canonical concept pages (strategies, algorithms, architectural patterns, risk principles)",
+        "Canonical concept pages (strategies, algorithms, architectural patterns, methods)",
     )?;
     engine.set_path_context(
         Some(CollectionScope::Wiki),
         "/syntheses",
-        "Cross-video comparative syntheses, tables, and knowledge maps",
+        "Cross-source comparative syntheses, tables, and knowledge maps",
     )?;
 
-    println!("=== Khởi tạo Live YouTube Playlist LLM Wiki (100% Agent-Driven + Skills) ===");
+    println!("=== Khởi tạo Multi-Subagent LLM Wiki (Topic Source Collection + Reactive Auto-Ingest) ===");
     println!("- Playlist URL : {playlist_url}");
     println!("- Model        : {model}");
     println!("- Skills Dir   : {}", skills_dir.display());
     println!("- Vault Path   : {}", vault_dir.display());
 
-    // 2. Ghi file prompt cho Root Agent (`coordinator`) và Subagent (`video_ingestor`)
-    let coordinator_prompt_path = prompts_dir.join("coordinator.md");
-    let ingestor_prompt_path = prompts_dir.join("video_ingestor.md");
-    std::fs::write(&coordinator_prompt_path, COORDINATOR_PROMPT)?;
-    std::fs::write(&ingestor_prompt_path, VIDEO_INGESTOR_PROMPT)?;
+    // 2. Ghi file prompt cho Root Dispatcher (`root`) và 3 Subagent chuyên biệt
+    let root_prompt_path = prompts_dir.join("root.md");
+    let collector_prompt_path = prompts_dir.join("source_collector.md");
+    let ingestor_prompt_path = prompts_dir.join("wiki_ingestor.md");
+    let curator_prompt_path = prompts_dir.join("wiki_curator.md");
+    std::fs::write(&root_prompt_path, ROOT_DISPATCHER_PROMPT)?;
+    std::fs::write(&collector_prompt_path, SOURCE_COLLECTOR_PROMPT)?;
+    std::fs::write(&ingestor_prompt_path, WIKI_INGESTOR_PROMPT)?;
+    std::fs::write(&curator_prompt_path, WIKI_CURATOR_PROMPT)?;
 
     let shared_env = Arc::new(SharedEnv {
         engine: engine.clone(),
@@ -148,8 +154,21 @@ async fn main() -> Result<()> {
         videos: Mutex::new(Vec::new()),
     });
 
-    // 3. Khởi tạo `Orchestrator` với `.with_skills_dir(...)` và `.with_project_instructions(SCHEMA.md)`
-    let orch_cfg = OrchestratorConfig::new(
+    let context_limit_tokens: usize = std::env::var("WIKI_CONTEXT_LIMIT_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200_000);
+    let max_output_tokens: u32 = std::env::var("WIKI_MAX_OUTPUT_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16_384);
+
+    // 3. Khởi tạo `Orchestrator`:
+    //    - `root` (Primary): CHỈ có quyền gọi tool `subagent` (`with_allowed_tools(["subagent"])`).
+    //    - `source_collector` (Subagent): Chuyên lấy chi tiết playlist & lưu vào `sources/<domain>/<topic>/` theo chủ đề.
+    //    - `wiki_ingestor` (Subagent): Chuyên Ingest file mới từ `sources/` vào `wiki/` theo skill `wiki-taxonomy` + `wiki-ingest`.
+    //    - `wiki_curator` (Subagent): Chuyên tổng hợp `wiki/syntheses/` & chạy `wiki_lint` theo skill `wiki-query` + `wiki-lint`.
+    let mut orch_cfg = OrchestratorConfig::new(
         LlmConfig {
             providers: vec![LlmProviderConfig {
                 id: "live".into(),
@@ -160,41 +179,70 @@ async fn main() -> Result<()> {
             }],
         },
         vec![
-            AgentDefinition::new("coordinator", "live", &model)
+            AgentDefinition::new("root", "live", &model)
                 .with_mode(AgentMode::Primary)
-                .with_prompt_path(&coordinator_prompt_path)
-                .with_context_limit_tokens(7_000)
-                .with_allowed_skills([
-                    "karpathy-wiki-taxonomy",
-                    "deep-video-wiki-ingest",
-                    "karpathy-wiki-synthesis-lint",
-                ])
+                .with_prompt_path(&root_prompt_path)
+                .with_context_limit_tokens(context_limit_tokens)
+                .with_max_output_tokens(max_output_tokens)
+                .with_allowed_tools(["subagent"]),
+            AgentDefinition::new("source_collector", "live", &model)
+                .with_mode(AgentMode::Subagent)
+                .with_description(
+                    "Inspects external sources (e.g. YouTube playlist), extracts detailed transcripts/metadata, classifies topic hierarchy (<domain>/<topic>), and saves raw Markdown files into sources/<domain>/<topic>/<slug>.md",
+                )
+                .with_prompt_path(&collector_prompt_path)
+                .with_context_limit_tokens(context_limit_tokens)
+                .with_max_output_tokens(max_output_tokens)
+                .with_allowed_skills(["wiki-taxonomy"])
                 .with_allowed_tools([
                     "skill",
-                    "subagent",
                     "yt_list_playlist",
+                    "yt_fetch_transcript",
+                    "wiki_tree",
                     "wiki_get",
                     "wiki_write_file",
                     "wiki_patch_file",
-                    "wiki_delete_file",
-                    "wiki_file_synthesis",
-                    "wiki_lint",
                 ]),
-            AgentDefinition::new("video_ingestor", "live", &model)
+            AgentDefinition::new("wiki_ingestor", "live", &model)
                 .with_mode(AgentMode::Subagent)
                 .with_description(
-                    "Fetches one YouTube video's transcript via yt_fetch_transcript, writes a deep technical wiki page via wiki_ingest_source, and compounds canonical entities/concepts and cross-video links",
+                    "Ingests a newly added source file from sources/<path>.md into wiki/ (wiki/sources/<path>.md, wiki/entities/..., wiki/concepts/...) using universal wiki-taxonomy and wiki-ingest skills",
                 )
                 .with_prompt_path(&ingestor_prompt_path)
-                .with_context_limit_tokens(7_000)
-                .with_allowed_skills(["karpathy-wiki-taxonomy", "deep-video-wiki-ingest"])
+                .with_context_limit_tokens(context_limit_tokens)
+                .with_max_output_tokens(max_output_tokens)
+                .with_allowed_skills(["wiki-taxonomy", "wiki-ingest"])
                 .with_allowed_tools([
                     "skill",
-                    "yt_fetch_transcript",
+                    "wiki_tree",
                     "wiki_get",
+                    "wiki_multi_get",
+                    "wiki_query",
+                    "wiki_metadata",
                     "wiki_ingest_source",
                     "wiki_write_file",
                     "wiki_patch_file",
+                ]),
+            AgentDefinition::new("wiki_curator", "live", &model)
+                .with_mode(AgentMode::Subagent)
+                .with_description(
+                    "Synthesizes cross-source insights into wiki/syntheses/ and runs wiki_lint repairs until is_healthy is true using universal wiki-query and wiki-lint skills",
+                )
+                .with_prompt_path(&curator_prompt_path)
+                .with_context_limit_tokens(context_limit_tokens)
+                .with_max_output_tokens(max_output_tokens)
+                .with_allowed_skills(["wiki-taxonomy", "wiki-query", "wiki-lint"])
+                .with_allowed_tools([
+                    "skill",
+                    "wiki_tree",
+                    "wiki_get",
+                    "wiki_multi_get",
+                    "wiki_query",
+                    "wiki_file_synthesis",
+                    "wiki_write_file",
+                    "wiki_patch_file",
+                    "wiki_delete_file",
+                    "wiki_lint",
                 ]),
         ],
         &store_dir,
@@ -202,7 +250,19 @@ async fn main() -> Result<()> {
     .with_skills_dir(&skills_dir)
     .with_project_instructions(engine.config().schema_path());
 
-    // 4. Đăng ký 2 YouTube tools + toàn bộ native tools của `WikiEngine`
+    // Tinh chỉnh Auto-Compaction & trần Tool Output kết hợp cơ chế đọc phân trang `doc_theo_dong` của `javis-os`:
+    // - `context_limit_tokens = 200_000` (khớp với context window 200K–256K của `oc/nemotron-3-ultra-free`,
+    //   có thể ghi đè qua biến môi trường `WIKI_CONTEXT_LIMIT_TOKENS` nếu dùng model nhỏ hơn).
+    // - `compaction_threshold_percent = 85`: Chỉ nén khi chạm 85% ngân sách context (170K tokens).
+    // - `compaction_keep_recent = 6`: Giữ nguyên 6 lượt trao đổi gần nhất nếu phiên kéo dài.
+    // - `tool_output_cap_bytes = 24 * 1024`: Trần bảo vệ an toàn cho một tool output đơn lẻ.
+    let read_budget = AdaptiveReadBudget::for_context_limit(context_limit_tokens);
+    orch_cfg.runtime.context_limit_tokens = context_limit_tokens;
+    orch_cfg.runtime.compaction_threshold_percent = 85;
+    orch_cfg.runtime.compaction_keep_recent = 6;
+    orch_cfg.runtime.tool_output_cap_bytes = (read_budget.max_window_chars * 3 / 2).max(24 * 1024);
+
+    // 4. Đăng ký YouTube tools + toàn bộ native tools của `WikiEngine`
     let mut builder = Orchestrator::builder(orch_cfg)
         .register_tool(Arc::new(YtListPlaylistTool {
             env: shared_env.clone(),
@@ -224,12 +284,19 @@ async fn main() -> Result<()> {
             engine: engine.clone(),
             spec,
             effect,
+            read_budget,
         }));
     }
 
     let orch = builder.build().await?;
-    let turn_res =
-        run_orchestrator_turn(&orch, &playlist_url, &api_key, Duration::from_secs(2400)).await;
+    let turn_res = run_orchestrator_turn(
+        &orch,
+        &shared_env,
+        &playlist_url,
+        &api_key,
+        Duration::from_secs(4800),
+    )
+    .await;
     let shutdown_res = orch.shutdown().await;
     turn_res?;
     shutdown_res?;
@@ -257,12 +324,38 @@ mod tests {
     }
 
     #[test]
-    fn test_skills_directory_has_valid_frontmatter() {
+    fn test_long_vtt_wraps_into_multiple_lines_and_paginates_with_budget() {
+        let mut long_vtt = String::from("WEBVTT\n\n");
+        for i in 1..=25 {
+            long_vtt.push_str(&format!(
+                "00:00:{i:02}.000 --> 00:00:{:02}.000\nĐây là câu phụ đề thứ {i} dùng để kiểm tra chia dòng tự động cho transcript dài.\n\n",
+                i + 1
+            ));
+        }
+        let cleaned = vtt_to_text(&long_vtt);
+        let line_count = cleaned.lines().count();
+        assert!(
+            line_count >= 10,
+            "Long VTT must be wrapped into multiple lines for line-based pagination, got {line_count} lines"
+        );
+
+        let page1 = llm_wiki::slice_lines_with_budget(&cleaned, Some(1), Some(5), Some(1_000), true);
+        assert!(page1.contains("Đã đọc dòng 1-5 trên tổng"));
+        assert!(page1.contains("from_line=6"));
+
+        let page_last =
+            llm_wiki::slice_lines_with_budget(&cleaned, Some(6), Some(50), Some(10_000), true);
+        assert!(page_last.contains("Đã đọc đến cuối file: dòng 6-"));
+    }
+
+    #[test]
+    fn test_universal_skills_directory_has_valid_frontmatter() {
         let skills_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("skills");
         for skill_id in [
-            "karpathy-wiki-taxonomy",
-            "deep-video-wiki-ingest",
-            "karpathy-wiki-synthesis-lint",
+            "wiki-taxonomy",
+            "wiki-ingest",
+            "wiki-query",
+            "wiki-lint",
         ] {
             let p = skills_root.join(skill_id).join("SKILL.md");
             assert!(p.is_file(), "Missing skill file: {}", p.display());
@@ -272,4 +365,3 @@ mod tests {
         }
     }
 }
-

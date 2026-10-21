@@ -29,6 +29,10 @@ pub use db::filter_sql::{
     ComparisonOperator, LogicalOperator, MetadataCondition, MetadataFilter, NotOperator,
 };
 pub use error::{WikiError, WikiResult};
+pub use fs::file_ops::{
+    slice_and_format_lines, slice_lines_with_budget, DEFAULT_READ_MAX_CHARS,
+    DEFAULT_READ_WINDOW_LINES,
+};
 pub use fs::tree::{FileTreeNode, NodeType, TreeDocMeta, TreeOptions, TreeScope};
 pub use graph::analysis::{GraphData, GraphEdge, GraphNode};
 pub use markdown::chunker::{smart_chunk_markdown, MarkdownChunk};
@@ -77,7 +81,10 @@ use crate::search::rrf::execute_hybrid_query;
 use crate::search::vector::{embed_pending_documents, search_vector};
 use crate::tools::definitions::build_llm_tool_definitions;
 use crate::tools::executor::execute_tool_call;
-use crate::wiki::index_md::{generate_index_md_content, DEFAULT_SCHEMA_MD};
+use crate::wiki::index_md::{
+    generate_compact_index_md, generate_index_md_content, DEFAULT_COMPACT_INDEX_MAX_CHARS,
+    DEFAULT_SCHEMA_MD,
+};
 use crate::wiki::ingest::{
     normalize_source_scoped_path, render_source_wiki_markdown, render_synthesis_markdown,
 };
@@ -547,6 +554,18 @@ impl WikiEngine {
         } else {
             self.rebuild_or_sync_index_md()
         }
+    }
+
+    /// Generate a compact, token-budgeted Wiki Index (`slug -> [[path|Title]] [aliases]`)
+    /// inspired by `javis-os` `_read_index`, capping output at `max_chars` (or `DEFAULT_COMPACT_INDEX_MAX_CHARS` if 0).
+    pub fn read_compact_index_md(&self, max_chars: usize) -> WikiResult<String> {
+        let budget = if max_chars == 0 {
+            DEFAULT_COMPACT_INDEX_MAX_CHARS
+        } else {
+            max_chars
+        };
+        let conn = self.db.lock().unwrap();
+        generate_compact_index_md(&conn, &self.config, budget)
     }
 
     /// Rebuild and index `wiki/index.md` from all currently indexed wiki pages.

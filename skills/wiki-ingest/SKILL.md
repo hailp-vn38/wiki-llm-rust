@@ -13,9 +13,12 @@ Execute this disciplined 4-stage workflow whenever ingesting one or more raw sou
 
 ---
 
-## Stage 1: Inspect Existing Wiki, Topic Folders, Tags & Analyze the Source
-1. Call `wiki_get(file="wiki/index.md")`, `wiki_tree(scope="wiki")` (and `wiki_metadata` or `wiki_schema(mode="read")` if needed) to inspect existing pages, canonical slugs, **existing topic folders**, and **existing tag prefixes**.
-2. Read the raw source via `wiki_get(file="sources/<source_rel_path>")` (or chunk-by-chunk using `from_line` / `max_lines` for very long sources).
+## Stage 1: Inspect Existing Wiki, Topic Folders, Tags & Analyze the Source (3-Pass Long Markdown Strategy)
+1. Call `wiki_get(file="wiki/index.md")`, `wiki_tree(scope="wiki")` (and `wiki_metadata` or `wiki_schema(mode="read")` if needed) to inspect existing pages, canonical slugs, `aliases`, **existing topic folders**, and **existing tag prefixes**.
+2. **3-Pass Line-Bounded Reading (`from_line` / `max_lines` — `javis-os` Discipline)**:
+   - **Pass 1 (Initial Window & Structure Map)**: Call `wiki_get(file="sources/<source_rel_path>", from_line=1, max_lines=110)`.
+   - **Pass 2 (Sequential Line Windows for Long Sources)**: If the output ends with a continuation footer (`… [Đã đọc dòng X-Y trên tổng Z dòng... gọi lại wiki_get với from_line=Y+1]`), call `wiki_get` with `from_line=Y+1` sequentially until all sections are covered. **Never** call `wiki_get` twice with the same `from_line`.
+   - **Pass 3 (Coverage Check)**: Ensure every major section/heading of the source is represented before finalizing pages.
 3. Perform a structured analysis covering:
    - **Topic & Folder Classification (Derived from Source)**:
      - Identify the primary `domain` (e.g., `algo-trading`, `ai-engineering`, `distributed-systems`) and `topic` (e.g., `grid-dca`, `hybrid-search`, `volatility-filtering`) of the source.
@@ -55,10 +58,11 @@ Call `wiki_ingest_source` for `source_rel_path` (do NOT invent a random filename
 For every canonical slug in `related_entities` (`entities/<slug>.md`) and `related_concepts` (`concepts/<slug>.md`):
 1. **If the page does NOT exist in `wiki/index.md`**:
    - Call `wiki_write_file(scope="wiki", rel_path="entities/<slug>.md" | "concepts/<slug>.md", content=...)`.
-   - The opening paragraph MUST define what the entity/concept is, followed by detailed synthesis from the source, and a backlink section citing `[[wiki/sources/<source_rel_path>|<Title>]]` and `[[sources/<source_rel_path>|<filename>]]`.
+   - **Frontmatter `aliases`**: Include `aliases: [...]` with abbreviations and English/Vietnamese synonyms so future ingests and QMD searches automatically deduplicate.
+   - **Contextual Retrieval Positioning Rule**: The opening 1–2 sentences MUST be self-contained (stating what the entity/concept is, which domain/system it belongs to, and when it is used), followed by detailed synthesis from the source, and a backlink section citing `[[wiki/sources/<source_rel_path>|<Title>]]` and `[[sources/<source_rel_path>|<filename>]]`.
 2. **If the page ALREADY exists in `wiki/index.md` (Page Merge Rules)**:
-   - Call `wiki_get` to read the existing page first.
-   - Merge the new source-backed material into the existing page via `wiki_write_file` or `wiki_patch_file`:
+   - Under tight context budgets, prefer calling `wiki_patch_file` with `append_text` directly to add the new source's contribution without reloading the entire file into context.
+   - When performing a full merge (`wiki_get` + `wiki_write_file`):
      - Preserve every factual claim from both the existing page and the new source (never drop prior source contributions).
      - Union the `sources`, `tags`, and `aliases` frontmatter lists while keeping the original `title` and `category` locked.
      - Keep subject/source boundaries exact; if the new source contradicts an existing claim, keep both claims and add a `> [!WARNING] Contradiction / Caveat` callout citing both `[[sources/...]]` files.

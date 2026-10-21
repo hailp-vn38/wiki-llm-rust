@@ -232,3 +232,121 @@ pub fn generate_index_md_content(
     let _ = source_summaries.first().map(|e| &e.file_stem);
     Ok(md)
 }
+
+/// Default character budget for compact index injection (mirrors `javis-os` `WIKI_INDEX_MAX = 2500`).
+pub const DEFAULT_COMPACT_INDEX_MAX_CHARS: usize = 3_000;
+
+/// Build a compact, slug-oriented Wiki Index inspired by `javis-os` (`learn._read_index`):
+/// - Lists existing `wiki/sources/`, `wiki/entities/`, `wiki/concepts/`, and `wiki/syntheses/` slugs
+///   with titles and `aliases` (omitting verbose descriptions and timestamps to save context tokens).
+/// - Stops cleanly at a line boundary if `max_chars` is reached and appends an explicit overflow notice
+///   telling the agent how many pages were omitted and instructing it to call `wiki_query`/`wiki_tree`.
+pub fn generate_compact_index_md(
+    conn: &Connection,
+    config: &WikiConfig,
+    max_chars: usize,
+) -> WikiResult<String> {
+    let mut stmt = conn.prepare(
+        "SELECT rel_path, scoped_path, title, category, aliases_json
+         FROM documents
+         WHERE collection = 'wiki' AND scoped_path NOT IN ('index.md', 'log.md')
+         ORDER BY
+            CASE category
+                WHEN 'entity' THEN 0
+                WHEN 'concept' THEN 1
+                WHEN 'source_summary' THEN 2
+                WHEN 'synthesis' THEN 3
+                ELSE 4
+            END,
+            scoped_path ASC",
+    )?;
+
+    struct CompactItem {
+        rel_path: String,
+        scoped_path: String,
+        title: String,
+        category: String,
+        aliases: Vec<String>,
+    }
+
+    let items: Vec<CompactItem> = stmt
+        .query_map([], |r| {
+            let aliases_json: String = r.get(4)?;
+            let aliases: Vec<String> = serde_json::from_str(&aliases_json).unwrap_or_default();
+            Ok(CompactItem {
+                rel_path: r.get(0)?,
+                scoped_path: r.get(1)?,
+                title: r.get(2)?,
+                category: r
+                    .get::<_, Option<String>>(3)?
+                    .unwrap_or_else(|| "wiki_page".to_string()),
+                aliases,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if items.is_empty() {
+        return Ok(format!(
+            "# Compact Wiki Index (`{}/index.md`)\n_Chưa có trang Wiki nào._\n",
+            config.wiki_dir_name
+        ));
+    }
+
+    let budget = max_chars.max(400);
+    let mut out = format!(
+        "# Compact Wiki Index (`{}/index.md` — {} trang)\n",
+        config.wiki_dir_name,
+        items.len()
+    );
+    let mut current_cat = String::new();
+    let mut included = 0usize;
+
+    for item in &items {
+        let section_header = match item.category.as_str() {
+            "entity" => "## Entities (`wiki/entities/`)\n",
+            "concept" => "## Concepts (`wiki/concepts/`)\n",
+            "source_summary" => "## Sources (`wiki/sources/`)\n",
+            "synthesis" => "## Syntheses (`wiki/syntheses/`)\n",
+            _ => "## Other (`wiki/`)\n",
+        };
+
+        let link_target = item
+            .rel_path
+            .strip_suffix(".md")
+            .unwrap_or(&item.rel_path);
+        let slug = item
+            .scoped_path
+            .strip_suffix(".md")
+            .unwrap_or(&item.scoped_path);
+        let alias_suffix = if item.aliases.is_empty() {
+            String::new()
+        } else {
+            format!(" [aliases: {}]", item.aliases.join(", "))
+        };
+        let line = format!("- `{slug}` -> [[{link_target}|{}]]{alias_suffix}\n", item.title);
+
+        let needed = (if current_cat != item.category {
+            section_header.len()
+        } else {
+            0
+        }) + line.len();
+
+        if included > 0 && out.len() + needed > budget {
+            let remaining = items.len() - included;
+            out.push_str(&format!(
+                "... (còn {remaining} trang nữa không liệt kê hết — dùng `wiki_query` hoặc `wiki_tree` để kiểm tra trước khi tạo trang mới)\n"
+            ));
+            break;
+        }
+
+        if current_cat != item.category {
+            current_cat = item.category.clone();
+            out.push_str(section_header);
+        }
+        out.push_str(&line);
+        included += 1;
+    }
+
+    Ok(out)
+}

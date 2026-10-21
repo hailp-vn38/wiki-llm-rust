@@ -11,7 +11,7 @@ use crate::tools::SharedEnv;
 use crate::Result;
 
 // ---------------------------------------------------------------------------
-// Đọc cấu hình `.env.live` & chạy Orchestrator
+// Đọc cấu hình `.env.live` & chạy Orchestrator với Auto-Flow Watcher
 // ---------------------------------------------------------------------------
 
 fn read_env_file(path: &Path) -> HashMap<String, String> {
@@ -73,27 +73,62 @@ pub(crate) fn resolve_llm_credentials(env_file: &Path) -> Result<(String, String
     Ok((endpoint, model, api_key))
 }
 
+fn explain_error_code(code: &str) -> &'static str {
+    match code {
+        "CHILD_FAILED" => "subagent con không hoàn tất (do lỗi Provider rate-limit/timeout hoặc vượt ngưỡng token)",
+        "PROVIDER_UNAVAILABLE" => "LLM Provider tạm thời lỗi hoặc chạm giới hạn Rate-Limit (HTTP 429/5xx)",
+        "PROVIDER_TIMEOUT" => "LLM Provider phản hồi quá thời gian chờ",
+        "CONTEXT_LIMIT" => "vượt quá giới hạn Context Window (token limit) của model",
+        "WIKI_TOOL_ERROR" => "tham số hoặc đường dẫn tài liệu truyền vào Wiki tool chưa khớp",
+        _ => "",
+    }
+}
+
 fn print_event(data: &Value, secret: &str) {
     let payload = &data["payload"];
     let session = data["session_id"].as_str().unwrap_or("");
     let tag = if session == data["root_session_id"].as_str().unwrap_or("") {
-        "coordinator".to_string()
+        "root-dispatcher".to_string()
     } else {
-        format!("ingestor:{}", session.chars().take(8).collect::<String>())
+        format!("subagent:{}", session.chars().take(8).collect::<String>())
     };
     let tool = payload["tool_name"].as_str().unwrap_or("?");
     let line = match data["event_type"].as_str().unwrap_or("") {
         "tool.started" => format!("[{tag}] ▶ {tool}"),
         "tool.progress" => format!("[{tag}] … {}", payload["message"].as_str().unwrap_or("")),
         "tool.completed" => format!("[{tag}] ✔ {tool}"),
-        "tool.failed" => format!(
-            "[{tag}] ✘ {tool} ({}: {})",
-            payload["error_code"].as_str().unwrap_or(""),
-            payload["error"]
+        "tool.failed" | "tool.interrupted" => {
+            let code = payload["error_code"]
                 .as_str()
+                .or_else(|| payload["status"].as_str())
+                .unwrap_or("UNKNOWN");
+            let detail = payload["error"]
+                .as_str()
+                .or_else(|| payload["error"]["message"].as_str())
                 .or_else(|| payload["message"].as_str())
-                .unwrap_or("")
-        ),
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| explain_error_code(code));
+            if detail.is_empty() {
+                format!("[{tag}] ✘ {tool} ({code})")
+            } else {
+                format!("[{tag}] ✘ {tool} ({code}: {detail})")
+            }
+        }
+        "compaction.started" => {
+            format!("[{tag}] ⟳ compaction.started (đang tóm tắt lịch sử context để giải phóng token...)")
+        }
+        "compaction.completed" => {
+            format!("[{tag}] ✔ compaction.completed (đã nén lịch sử hội thoại thành bản tóm tắt)")
+        }
+        "run.failed" => {
+            let code = payload["error_code"].as_str().unwrap_or("UNKNOWN");
+            let hint = explain_error_code(code);
+            if hint.is_empty() {
+                format!("[{tag}] ⚠ run.failed ({code})")
+            } else {
+                format!("[{tag}] ⚠ run.failed ({code}: {hint})")
+            }
+        }
         _ => return,
     };
     if !secret.is_empty() {
@@ -103,19 +138,85 @@ fn print_event(data: &Value, secret: &str) {
     }
 }
 
+/// Kiểm tra trạng thái thực tế của Vault trên đĩa để tạo prompt chính xác cho phần việc còn lại
+/// mà không cần phụ thuộc vào lịch sử hội thoại dài của session cũ.
+fn build_next_autoflow_prompt(env: &SharedEnv, playlist_url: &str) -> Result<Option<String>> {
+    let _ = env.engine.rebuild_or_sync_index_md();
+    let status = env.engine.status()?;
+    if status.sources_count == 0 {
+        return Ok(Some(format!(
+            "Hãy lấy thông tin chi tiết trong playlist và lưu vào source theo chủ đề.\nPlaylist URL: {playlist_url}"
+        )));
+    }
+
+    let lint = env.engine.lint_wiki()?;
+    let compact_index = env
+        .engine
+        .read_compact_index_md(2_500)
+        .unwrap_or_default();
+
+    if !lint.uningested_sources.is_empty() {
+        let new_sources_list = lint
+            .uningested_sources
+            .iter()
+            .map(|s| format!("- `{}`", s.source_rel_path.trim_start_matches("sources/")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!(
+            "\n[Auto-Flow Watcher] Phát hiện {} tài liệu trong `sources/` chưa được Ingest vào `wiki/` -> Điều phối subagent `wiki_ingestor`...",
+            lint.uningested_sources.len()
+        );
+        return Ok(Some(format!(
+            "[AUTO-FLOW: NEW SOURCES DETECTED]\n\
+             Hệ thống phát hiện {} tài liệu mới trong `sources/` chưa được ingest vào `wiki/`:\n{}\n\n\
+             === CURRENT COMPACT WIKI INDEX ===\n{}\n\
+             ==================================\n\n\
+             Hãy điều phối subagent `wiki_ingestor` (gọi tuần tự từng file một) để ingest toàn bộ các file mới này vào `wiki/`, sau đó gọi `wiki_curator` để tổng hợp Synthesis và chạy `wiki_lint`.",
+            lint.uningested_sources.len(),
+            new_sources_list,
+            compact_index.trim()
+        )));
+    }
+
+    if !lint.is_healthy {
+        println!(
+            "\n[Auto-Flow Watcher] Phát hiện vấn đề cần hoàn thiện trong Wiki (broken_links={}, orphan_wiki_pages={}) -> Điều phối subagent `wiki_curator`...",
+            lint.broken_links.len(),
+            lint.orphan_wiki_pages.len()
+        );
+        return Ok(Some(format!(
+            "[AUTO-FLOW: WIKI LINT]\n\
+             `wiki_lint` phát hiện `broken_links={:?}` và `orphan_wiki_pages={:?}`.\n\n\
+             === CURRENT COMPACT WIKI INDEX ===\n{}\n\
+             ==================================\n\n\
+             Hãy điều phối subagent `wiki_curator` để sửa toàn bộ liên kết gãy/trang mồ côi và đảm bảo `is_healthy: true`.",
+            lint.broken_links,
+            lint.orphan_wiki_pages,
+            compact_index.trim()
+        )));
+    }
+
+    Ok(None)
+}
+
 pub(crate) async fn run_orchestrator_turn(
     orch: &Orchestrator,
+    env: &SharedEnv,
     playlist_url: &str,
     secret: &str,
     timeout: Duration,
 ) -> Result<()> {
     let caller = CallerContext::new("wiki-maintainer", "youtube-playlist-wiki");
-    let session_id = orch.create_session(&caller, "coordinator").await?;
+    let mut session_id = orch.create_session(&caller, "root").await?;
     let mut sub = orch.subscribe(&caller, &session_id).await?;
+
+    // Bước 1: Yêu cầu đơn giản, tự nhiên — lấy thông tin chi tiết trong playlist lưu vào `sources/` theo chủ đề.
     let mut current_prompt = format!(
-        "Build a deep, non-fragmented Karpathy LLM Wiki from this YouTube playlist.\nPlaylist URL: {playlist_url}"
+        "Hãy lấy thông tin chi tiết trong playlist và lưu vào source theo chủ đề.\nPlaylist URL: {playlist_url}"
     );
     let mut retries = 0usize;
+    let max_retries = 5usize;
+    let mut auto_flow_rounds = 0usize;
 
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
@@ -139,27 +240,67 @@ pub(crate) async fn run_orchestrator_turn(
                         continue;
                     }
                     if result.status != RunStatus::Completed {
-                        let is_provider_err = result
+                        let is_recoverable = result
                             .error
                             .as_ref()
-                            .is_some_and(|e| e.code == "PROVIDER_UNAVAILABLE" || e.code == "PROVIDER_TIMEOUT");
-                        if is_provider_err && retries < 3 {
+                            .is_some_and(|e| {
+                                matches!(
+                                    e.code.as_str(),
+                                    "PROVIDER_UNAVAILABLE" | "PROVIDER_TIMEOUT" | "CONTEXT_LIMIT" | "CHILD_FAILED"
+                                )
+                            });
+                        if is_recoverable && retries < max_retries {
                             retries += 1;
+                            // Exponential backoff (10s, 20s, 35s, 50s, 60s) để vượt qua cửa sổ Rate-Limit (RPM/TPM)
+                            let backoff_secs = match retries {
+                                1 => 10,
+                                2 => 20,
+                                3 => 35,
+                                4 => 50,
+                                _ => 60,
+                            };
                             println!(
-                                "\n[retry {retries}/3] Gateway trả về {:?}; đợi 5s rồi tiếp tục trên cùng session...",
+                                "\n[retry {retries}/{max_retries}] Turn dừng do {:?}; đợi {backoff_secs}s rồi tạo session điều phối mới với danh sách công việc còn lại...",
                                 result.error
                             );
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                            current_prompt = "Continue from where you left off. Check `wiki/index.md` via `wiki_get` and complete the remaining steps.".to_string();
-                            break;
+                            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+
+                            // Mở session `root` mới để làm sạch lịch sử context cũ, đồng thời tính lại chính xác các file chưa ingest từ đĩa
+                            session_id = orch.create_session(&caller, "root").await?;
+                            sub = orch.subscribe(&caller, &session_id).await?;
+                            if let Some(next_prompt) = build_next_autoflow_prompt(env, playlist_url)? {
+                                current_prompt = next_prompt;
+                                break;
+                            } else {
+                                return Ok(());
+                            }
                         }
                         return Err(io::Error::other(format!("Turn kết thúc với lỗi: {:?}", result.error)).into());
                     }
+
+                    // Turn thành công -> reset bộ đếm retry liên tiếp
+                    retries = 0;
+
                     println!(
-                        "\n=== [Kết quả từ Agent `coordinator` ({})] ===\n{}",
+                        "\n=== [Kết quả Turn từ `root` ({})] ===\n{}",
                         result.status.as_str(),
                         result.output.unwrap_or_default()
                     );
+
+                    // Bước 2 (Reactive Auto-Flow): Kiểm tra trên đĩa xem còn tài liệu mới trong `sources/`
+                    // chưa được ingest vào `wiki/` hoặc có lỗi lint cần `wiki_curator` xử lý hay không.
+                    if auto_flow_rounds < 8 {
+                        if let Some(next_prompt) = build_next_autoflow_prompt(env, playlist_url)? {
+                            auto_flow_rounds += 1;
+                            // Khởi tạo session `root` mới cho mỗi vòng Auto-Flow để tránh tích lũy lịch sử
+                            // làm đầy token hoặc gây nhiễu (hallucinate) ở các lượt điều phối tiếp theo.
+                            session_id = orch.create_session(&caller, "root").await?;
+                            sub = orch.subscribe(&caller, &session_id).await?;
+                            current_prompt = next_prompt;
+                            break;
+                        }
+                    }
+
                     return Ok(());
                 },
                 _ = &mut deadline => {
@@ -171,21 +312,27 @@ pub(crate) async fn run_orchestrator_turn(
     }
 }
 
-/// Host chỉ đọc và xác minh kết quả trên đĩa sau khi Agent đã hoàn tất toàn bộ luồng.
+/// Host chỉ đọc và xác minh kết quả trên đĩa sau khi các Subagent đã hoàn tất toàn bộ luồng.
 pub(crate) fn verify_vault_on_disk(env: &SharedEnv) -> Result<()> {
     let videos = env.videos.lock().unwrap().clone();
     if videos.is_empty() {
-        return Err(io::Error::other("Agent chưa gọi yt_list_playlist").into());
+        return Err(io::Error::other("Subagent chưa gọi yt_list_playlist").into());
     }
 
     for v in &videos {
-        let src_file = env.engine.config().sources_dir().join(v.source_scoped_path());
+        let scoped = v.saved_source_scoped_path.as_deref().ok_or_else(|| {
+            io::Error::other(format!(
+                "Video `{}` chưa được lưu vào `sources/` theo chủ đề",
+                v.title
+            ))
+        })?;
+        let src_file = env.engine.config().sources_dir().join(scoped);
         let wiki_file = env
             .engine
             .config()
             .wiki_dir()
             .join("sources")
-            .join(v.source_scoped_path());
+            .join(scoped);
         if !src_file.exists() {
             return Err(
                 io::Error::other(format!("Thiếu Raw Source: {}", src_file.display())).into(),
@@ -193,7 +340,7 @@ pub(crate) fn verify_vault_on_disk(env: &SharedEnv) -> Result<()> {
         }
         if !wiki_file.exists() {
             return Err(io::Error::other(format!(
-                "Thiếu trang Wiki của video: {}",
+                "Thiếu trang Wiki của tài liệu nguồn: {}",
                 wiki_file.display()
             ))
             .into());
@@ -206,13 +353,13 @@ pub(crate) fn verify_vault_on_disk(env: &SharedEnv) -> Result<()> {
     let status = env.engine.status()?;
     let graph = env.engine.get_graph(None)?;
 
-    println!("\n=== [Xác minh Vault sau khi Agent hoàn tất (`WikiEngine`)] ===");
+    println!("\n=== [Xác minh Vault sau khi Multi-Subagent hoàn tất (`WikiEngine`)] ===");
     println!(
         "- Vault Root (Obsidian Vault): {}",
         env.engine.config().data_root.display()
     );
     println!(
-        "- Tầng 1 (`sources/`): {} file Raw Source Markdown",
+        "- Tầng 1 (`sources/`): {} file Raw Source Markdown (phân loại theo chủ đề)",
         status.sources_count
     );
     println!(
@@ -243,4 +390,3 @@ pub(crate) fn verify_vault_on_disk(env: &SharedEnv) -> Result<()> {
 
     Ok(())
 }
-
