@@ -1,0 +1,20 @@
+[package]
+name = "llm-wiki"
+version = "0.1.0"
+edition = "2021"
+description = "Local-first LLM Wiki & QMD Hybrid Search Engine compatible with Obsidian Graph View"
+license = "MIT"
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+pulldown-cmark = "0.12"
+regex = "1.11"
+globset = "0.4"
+walkdir = "2.5"
+blake3 = "1.5"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2.0"
+unicode-normalization = "0.1"
