@@ -39,4 +39,4 @@ cargo run --example youtube_playlist_wiki -- "<PLAYLIST_URL>" --limit 3 --lang e
 Xem chi tiết thiết kế kiến trúc và luồng xử lý tại:
 - [ARCHITECTURE.md](./ARCHITECTURE.md) — Đặc tả kỹ thuật, SQLite schema, thuật toán QMD & Rust API.
 - [docs/karpathy-llm-wiki.md](./docs/karpathy-llm-wiki.md) — Nguyên bản ý tưởng "LLM Wiki" của Andrej Karpathy và bảng ánh xạ vào `llm-wiki-rs`.
-- [examples/youtube_playlist_wiki.rs](./examples/youtube_playlist_wiki.rs) — Ứng dụng mẫu tích hợp [`orchestrator-agent`](https://crates.io/crates/orchestrator-agent) để xử lý YouTube Playlist thành Raw Sources (`sources/youtube/`) và tự động tổng hợp, liên kết chéo `[[WikiLinks]]`, kiểm tra sức khỏe (`lint_wiki`) trong `wiki/`.
+- [examples/youtube_playlist_wiki/](./examples/youtube_playlist_wiki/main.rs) — Ứng dụng mẫu tích hợp [`orchestrator-agent`](https://crates.io/crates/orchestrator-agent) để xử lý YouTube Playlist thành Raw Sources (`sources/youtube/`) và tự động tổng hợp, liên kết chéo `[[WikiLinks]]`, kiểm tra sức khỏe (`lint_wiki`) trong `wiki/`.

@@ -320,16 +320,28 @@ pub fn execute_tool_call(engine: &WikiEngine, tool_name: &str, args: Value) -> W
                 args.get("replacement_text").and_then(|v| v.as_str()),
             ) {
                 if !target.is_empty() {
-                    if !updated.contains(target) {
-                        return Err(WikiError::InvalidToolArguments {
-                            tool: tool_name.to_string(),
-                            message: format!(
-                                "`target_text` not found in '{}'",
-                                existing.info.rel_path
-                            ),
-                        });
+                    if updated.contains(target) {
+                        updated = updated.replace(target, replacement);
+                    } else {
+                        // Also allow matching if the caller omitted the surrounding `[[` and `]]`
+                        let wrapped = format!("[[{}]]", target.trim_start_matches("[[").trim_end_matches("]]"));
+                        if updated.contains(&wrapped) {
+                            let clean_rep = if replacement.trim().starts_with("[[") && replacement.trim().ends_with("]]") {
+                                replacement.trim().to_string()
+                            } else {
+                                format!("[[{}]]", replacement.trim())
+                            };
+                            updated = updated.replace(&wrapped, &clean_rep);
+                        } else {
+                            return Err(WikiError::InvalidToolArguments {
+                                tool: tool_name.to_string(),
+                                message: format!(
+                                    "`target_text` not found in '{}'",
+                                    existing.info.rel_path
+                                ),
+                            });
+                        }
                     }
-                    updated = updated.replace(target, replacement);
                 }
             }
 
