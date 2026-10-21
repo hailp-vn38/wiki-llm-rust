@@ -1,52 +1,142 @@
-# `llm-wiki` (Rust)
+<p align="right">🌐 <b>🇬🇧 English</b> · <a href="README.vi.md">🇻🇳 Tiếng Việt</a></p>
 
-Thư viện Rust local-first kết hợp kiến trúc **LLM Wiki** của Andrej Karpathy ([Gist `442a6bf555914893e9891c11519de94f`](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)) với động cơ xử lý & tìm kiếm **QMD (Query Markup Documents)** ([`tobi/qmd`](https://github.com/tobi/qmd)), tương thích 100% với **Obsidian's Graph View**.
+# LLM Wiki RS (`llm-wiki-rs`)
 
-## Tính Năng Nổi Bật
+A local-first Rust library combining Andrej Karpathy's **[LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)** compounding knowledge architecture with **[QMD (Query Markup Documents)](https://github.com/tobi/qmd)** hybrid Markdown search and 100% **[Obsidian Graph View](https://obsidian.md)** compatibility.
 
-1. **Logic xử lý & tìm kiếm QMD**:
-   - **Smart Markdown Chunking**: Cắt chunk (~900 tokens, 15% overlap) theo điểm ngắt ngữ nghĩa (Heading H1–H6, Code Fence Protection chống đứt khối code ` ``` `, Horizontal Rule, Paragraph) kèm công thức suy giảm khoảng cách bình phương.
-   - **Hybrid Search Pipeline**: Kết hợp **SQLite FTS5 (BM25)** + **Vector Search** (`vec_cosine_distance`) + **Reciprocal Rank Fusion (RRF, $k=60$)** (trọng số $2\times$ cho truy vấn đầu, thưởng hạng Top-1 $+0.05$, Top-2/3 $+0.02$) + **Position-Aware Reranker Blending**.
-   - **Mặc định tìm trên `wiki` & Trả về mối liên hệ `[[WikiLinks]]`**: Mặc định `query` / `wiki_query` tìm kiếm trên `collections: ["wiki"]` (có thể truyền `["sources"]` hoặc `["wiki", "sources"]` khi cần tìm trong raw sources). Mỗi `SearchResultItem` trả về kèm sẵn trạng thái liên kết đồ thị (`is_wiki_linked`, `outgoing_links`, `backlinks`, `unresolved_links`).
-   - **Metadata AST Filtering & Discovery**: Đánh chỉ mục YAML frontmatter và lọc đệ quy theo biểu thức logic (`and`, `or`, `not`, `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `nin`, `all`, `contains`, `prefix`, `suffix`, `exists`, `type`).
-2. **Tương thích Obsidian's Graph View**:
-   - Thư mục dữ liệu gốc (`data_root`) mở trực tiếp được bằng **Obsidian** như một Vault hoàn chỉnh (tự động tạo `.obsidian/graph.json` phân màu cho `sources`, `wiki/sources`, `wiki/entities`, `wiki/concepts`, `wiki/syntheses`).
-   - Hỗ trợ đầy đủ `[[WikiLinks]]`, `[[path#Heading|Alias]]`, `![[Embeds]]`, liên kết trong YAML Frontmatter (`source_file: "[[sources/...|...]]"`), và phân giải liên kết theo đúng thứ tự ưu tiên của Obsidian.
-3. **Chỉ cần cấu hình duy nhất 1 thư mục (`WikiEngine::open(data_root)`)**:
-   - Tự động khởi tạo `sources/`, `wiki/`, `SCHEMA.md`, `wiki/index.md`, `wiki/log.md` và cơ sở dữ liệu `.wiki/index.sqlite`.
-4. **Tự động tạo thư mục lồng nhau khi tạo file**:
-   - Khi truyền đường dẫn như `"docs/flow/lib.md"`, thư viện tự động kiểm tra chống Path Traversal và tạo các folder cha `docs/` -> `docs/flow/` rồi ghi `lib.md`.
-5. **Giữ nguyên tên file Source khi tạo Wiki (`Ingest`)**:
-   - Khi ingest `sources/docs/flow/lib.md`, trang tóm tắt trong `wiki/` được tạo tại `wiki/sources/docs/flow/lib.md` (giữ nguyên tên file `lib.md`, tuyệt đối không sinh ID ngẫu nhiên làm tên file).
-6. **API lấy cây thư mục (`get_tree`)**:
-   - Lấy cây thư mục đệ quy (`FileTreeNode` + `.to_ascii_tree()`) cho `sources`, `wiki`, toàn bộ vault, hoặc bất kỳ đường dẫn con nào.
-7. **Bộ 15 LLM Tools dựng sẵn & Thực thi Thích ứng theo Context Window (`AdaptiveReadBudget`)**:
-   - Cung cấp JSON Schema (`llm_tool_definitions()`), hàm phân loại `is_read_only_wiki_tool()`, hàm thực thi JSON (`execute_llm_tool()`) và hàm thực thi tối ưu token theo `context_limit_tokens` (`execute_llm_tool_with_budget()`).
-   - Tích hợp cơ chế đọc phân trang theo dòng của `javis-os` (`slice_lines_with_budget`), danh mục gọn `read_compact_index_md` (kèm `aliases` chống phân mảnh trang), và tự động sửa lỗi thẻ đóng `</mermaid>`.
-8. **Tiện ích Mở rộng Flow đa nguồn (`write_topic_source`, `apply_template`, `build_next_autoflow_prompt`)**:
-   - Hỗ trợ sẵn chuẩn hóa tiếng Việt (`fold_vietnamese`, `slugify`, `sanitize_topic_folder`), chuyển đổi phụ đề `vtt_to_text`, lưu Raw Source theo chủ đề `<domain>/<topic>` (`write_topic_source`), bộ System Prompts đa tác tử (`ROOT_DISPATCHER_PROMPT`, `SOURCE_COLLECTOR_PROMPT`, `WIKI_INGESTOR_PROMPT`, `WIKI_CURATOR_PROMPT`) và hàm lập kế hoạch tự động `build_next_autoflow_prompt`.
+- **Crate**: [`llm-wiki-rs`](https://crates.io/crates/llm-wiki-rs) `v0.1.1` (imported in Rust as `llm_wiki`), edition 2021
+- **Storage**: Embedded SQLite (`rusqlite` bundled + FTS5 BM25 + vector cosine distance + graph edge index) stored directly inside `<data_root>/.wiki/index.sqlite`
+- **Detailed Architecture**: [ARCHITECTURE.md](./ARCHITECTURE.md) · [docs/karpathy-llm-wiki.md](./docs/karpathy-llm-wiki.md)
 
-## Chạy Kiểm Thử & Ví Dụ
+## Features
+
+| Area | Description |
+|---|---|
+| **Single-Folder Setup** | `WikiEngine::open(data_root)` initializes `sources/`, `wiki/`, `SCHEMA.md`, `wiki/index.md`, `wiki/log.md`, `.obsidian/graph.json`, and `.wiki/index.sqlite` automatically. |
+| **QMD Smart Chunking** | ~900-token chunks with 15% overlap, semantic breakpoint scoring (`H1`–`H6`, paragraphs, horizontal rules), squared distance decay, and **Code Fence Protection** (never splits inside ```` ``` ```` blocks). |
+| **QMD Hybrid Search** | Combines **SQLite FTS5 (BM25)** + **Vector Similarity** + **Reciprocal Rank Fusion (RRF, $k=60$)** ($2\times$ weight for primary query, top-rank bonus $+0.05 / +0.02$) + **Position-Aware Reranker Blending**. |
+| **Wiki-First Query & Graph Relations** | Queries default to `collections: ["wiki"]` (pass `["sources"]` or `["wiki", "sources"]` to include raw sources). Every `SearchResultItem` includes `is_wiki_linked`, `outgoing_links`, `backlinks`, and `unresolved_links`. |
+| **Metadata AST Filter & Discovery** | Indexes YAML frontmatter and `qmd.metadata` into typed SQLite tables with recursive boolean filter AST (`and`, `or`, `not`, `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `nin`, `all`, `contains`, `prefix`, `suffix`, `exists`, `type`). |
+| **Obsidian Graph View** | Full support for `[[WikiLinks]]`, `[[path#Heading\|Alias]]`, `![[Embeds]]`, YAML frontmatter property links (`source_file: "[[sources/...\|...]]"`), 1-level `<domain>` folder routing (`wiki/entities/<domain>/`, `wiki/concepts/<domain>/`, `wiki/syntheses/<domain>/`), global unique slug redirect, and automatic on-disk WikiLink healing. |
+| **Exact Source Filename Preservation** | Ingesting `sources/docs/flow/lib.md` creates `wiki/sources/docs/flow/lib.md` (preserving `lib.md` — never a random hash/ID). |
+| **Nested Auto-Mkdir & Tree API** | Writing `"docs/flow/lib.md"` validates against path traversal (`..`) and creates intermediate directories automatically. `get_tree()` returns recursive `FileTreeNode` + `.to_ascii_tree()`. |
+| **13 Built-in LLM Tools & Adaptive Budget** | OpenAI/Anthropic/Gemini/MCP-ready tool schemas (`llm_tool_definitions()`) and `execute_llm_tool_with_budget()` with `AdaptiveReadBudget`, topic-prioritized compact index (`read_compact_index_md_for_topic`), and Reactive Auto-Flow (`build_next_autoflow_prompt`). |
+
+## Installation
+
+Add `llm-wiki-rs` to your `Cargo.toml`:
+
+```toml
+[dependencies]
+llm-wiki-rs = "0.1.1"
+```
+
+> Note: The library target name is `llm_wiki`, so you import it in Rust code with `use llm_wiki::*;`.
+
+## Quick Start
+
+```rust
+use llm_wiki::{
+    AdaptiveReadBudget, HybridQueryRequest, IngestSourceRequest, TreeOptions, TreeScope, WikiEngine,
+};
+use serde_json::json;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Open or initialize an Obsidian-compatible vault with a single folder path
+    let engine = WikiEngine::open("./my_knowledge_vault")?;
+
+    // 2. Write a nested raw source file (auto-creates `sources/docs/flow/`)
+    engine.write_source_file(
+        "docs/flow/lib.md",
+        "# Flow Engine\n\nFlow Engine is written in Rust and uses SQLite FTS5.",
+    )?;
+
+    // 3. Ingest source into `wiki/` (strictly preserves filename `lib.md` at `wiki/sources/docs/flow/lib.md`)
+    engine.ingest_source_to_wiki(IngestSourceRequest {
+        source_rel_path: "docs/flow/lib.md".to_string(),
+        target_wiki_path: None,
+        raw_source_content: None,
+        title: "Flow Engine Architecture".to_string(),
+        one_line_summary: "Summary of the Flow Engine architecture.".to_string(),
+        wiki_markdown_body: "Flow Engine uses [[rust]] and [[bm25-search]] for hybrid retrieval."
+            .to_string(),
+        tags: vec!["rust".to_string(), "search".to_string()],
+        related_entities: vec!["rust".to_string()],
+        related_concepts: vec!["bm25-search".to_string()],
+    })?;
+
+    // 4. Query (`collections` defaults to `["wiki"]`, and results include WikiLink relationships)
+    let hits = engine.query(HybridQueryRequest::from_query("Flow Engine hybrid retrieval"))?;
+    for hit in &hits {
+        println!(
+            "{} ({}) score={:.2} is_wiki_linked={} outgoing={:?} backlinks={:?}",
+            hit.rel_path, hit.docid, hit.score, hit.is_wiki_linked, hit.outgoing_links, hit.backlinks
+        );
+    }
+
+    // 5. Inspect directory tree
+    let tree = engine.get_tree(TreeOptions::for_scope(TreeScope::All))?;
+    println!("{}", tree.to_ascii_tree());
+
+    // 6. Execute built-in LLM tools with adaptive token budget
+    let budget = AdaptiveReadBudget::for_context_limit(200_000);
+    let out = engine.execute_llm_tool_with_budget(
+        "wiki_query",
+        json!({ "query": "Flow Engine" }),
+        budget,
+    )?;
+    println!("{}", out.content);
+
+    Ok(())
+}
+```
+
+## Built-in LLM Tools (`llm_tool_definitions`)
+
+| Tool Name | Mode | Description |
+|---|---|---|
+| `wiki_tree` | Read-Only | Get directory and file tree structure of `sources`, `wiki`, or `all` (JSON + ASCII tree). |
+| `wiki_query` | Read-Only | QMD Hybrid Search (`lex` BM25 + `vec` Semantic + `hyde` + RRF + Metadata AST `filter`). Defaults to `collections: ["wiki"]` and returns `is_wiki_linked`, `outgoing_links`, `backlinks`, `unresolved_links`. |
+| `wiki_get` | Read-Only | Read a document by path, stem, or `#docid` with `:from:count` line slicing and `AdaptiveReadBudget`. |
+| `wiki_multi_get` | Read-Only | Batch retrieve multiple documents by glob pattern (`wiki/entities/**/*.md`) or comma-separated list. |
+| `wiki_metadata` | Read-Only | Discover indexed YAML frontmatter keys, value types, and document counts. |
+| `wiki_status` | Read-Only | Return index health, collection document counts, and Obsidian graph link statistics. |
+| `wiki_graph_neighbors` | Read-Only | Inspect incoming backlinks and outgoing `[[WikiLinks]]` for a document or full graph summary. |
+| `wiki_write_file` | Mutating | Create or overwrite a Markdown file in `wiki/` or `sources/` (auto-creates nested folders & heals WikiLinks). |
+| `wiki_patch_file` | Mutating | Replace a target text block or append a section to an existing Markdown file. |
+| `wiki_ingest_source` | Mutating | Ingest a raw source from `sources/` into `wiki/` preserving the exact source filename, updating `wiki/index.md` and `wiki/log.md`. |
+| `wiki_file_synthesis` | Mutating | File a synthesis/comparison page into `wiki/syntheses/`, updating `wiki/index.md` and `wiki/log.md`. |
+| `wiki_lint` | Mutating | Audit the vault for uningested sources, broken `[[WikiLinks]]`, orphan wiki pages, unlinked mentions, and stale claims. |
+| `wiki_log` | Read/Mutate | Read recent chronological entries from `wiki/log.md` or append a new entry. |
+| `wiki_schema` | Read/Mutate | Read or update `SCHEMA.md`. |
+| `wiki_delete_file` | Mutating | Delete a duplicate or obsolete file in `wiki/` or `sources/`, pruning empty folders and refreshing `wiki/index.md`. |
+
+## Running Tests & Examples
 
 ```bash
-# Chạy toàn bộ test suite
+# Run unit & integration test suite
 cargo test
 
-# Chạy ví dụ minh họa toàn bộ luồng hoạt động cơ bản
+# Run basic end-to-end workflow example
 cargo run --example full_workflow
 
-# Chạy ví dụ Live YouTube Playlist -> Raw Source Markdown -> Karpathy LLM Wiki (dùng orchestrator-agent)
-cp .env.live.example .env.live   # điền G0_OPENAI_BASE_URL, G0_OPENAI_MODEL, G0_OPENAI_API_KEY
+# Run Live YouTube Playlist -> Raw Source Markdown -> Karpathy LLM Wiki (via orchestrator-agent)
+cp .env.live.example .env.live   # fill in G0_OPENAI_BASE_URL, G0_OPENAI_MODEL, G0_OPENAI_API_KEY
 cargo run --example youtube_playlist_wiki -- "<PLAYLIST_URL>" --limit 3 --lang en,vi
 
-# Chạy ví dụ PDF / Tài liệu -> anydoc (GFM Markdown) -> Multi-Subagent -> Karpathy LLM Wiki
+# Run PDF / Document -> anydoc (GFM Markdown) -> Multi-Subagent -> Karpathy LLM Wiki
 cargo run --example pdf_anydoc_wiki -- "<PDF_PATH>" --max-chars 60000
-# Hoặc chạy thử ngay với file PDF kỹ thuật mẫu tự sinh:
+# Or run immediately with a self-generated sample technical PDF:
 cargo run --example pdf_anydoc_wiki -- --sample-pdf
 ```
 
-Xem chi tiết thiết kế kiến trúc và luồng xử lý tại:
-- [ARCHITECTURE.md](./ARCHITECTURE.md) — Đặc tả kỹ thuật, SQLite schema, thuật toán QMD & Rust API.
-- [docs/karpathy-llm-wiki.md](./docs/karpathy-llm-wiki.md) — Nguyên bản ý tưởng "LLM Wiki" của Andrej Karpathy và bảng ánh xạ vào `llm-wiki-rs`.
-- [examples/youtube_playlist_wiki/](./examples/youtube_playlist_wiki/main.rs) — Ứng dụng mẫu tích hợp [`orchestrator-agent`](https://crates.io/crates/orchestrator-agent) để xử lý YouTube Playlist thành Raw Sources (`sources/<domain>/<topic>/`) và tự động tổng hợp, liên kết chéo `[[WikiLinks]]`, kiểm tra sức khỏe (`lint_wiki`) trong `wiki/`.
-- [examples/pdf_anydoc_wiki/](./examples/pdf_anydoc_wiki/main.rs) — Ứng dụng mẫu dùng [`anydoc`](https://crates.io/crates/anydoc) để chuyển đổi file PDF (hoặc DOCX/EPUB/PPTX/XLSX) sang GitHub-Flavored Markdown, phân loại vào `sources/<domain>/<topic>/` và điều phối Multi-Subagent biên dịch sang `wiki/`.
+## Documentation
+
+- [ARCHITECTURE.md](./ARCHITECTURE.md) — Technical specification, SQLite schema, QMD algorithms & Rust API reference.
+- [docs/karpathy-llm-wiki.md](./docs/karpathy-llm-wiki.md) — Andrej Karpathy's original LLM Wiki concept and mapping to `llm-wiki-rs`.
+- [examples/youtube_playlist_wiki/](./examples/youtube_playlist_wiki/main.rs) — Multi-subagent YouTube playlist ingestion into `sources/<domain>/<topic>/` and `wiki/`.
+- [examples/pdf_anydoc_wiki/](./examples/pdf_anydoc_wiki/main.rs) — Multi-subagent PDF/document ingestion using [`anydoc`](https://crates.io/crates/anydoc) and [`orchestrator-agent`](https://crates.io/crates/orchestrator-agent).
+
+## License
+
+Licensed under either of **MIT** or **Apache-2.0** at your option.
