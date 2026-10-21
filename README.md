@@ -19,8 +19,11 @@ Thư viện Rust local-first kết hợp kiến trúc **LLM Wiki** của Andrej 
    - Khi ingest `sources/docs/flow/lib.md`, trang tóm tắt trong `wiki/` được tạo tại `wiki/sources/docs/flow/lib.md` (giữ nguyên tên file `lib.md`, tuyệt đối không sinh ID ngẫu nhiên làm tên file).
 6. **API lấy cây thư mục (`get_tree`)**:
    - Lấy cây thư mục đệ quy (`FileTreeNode` + `.to_ascii_tree()`) cho `sources`, `wiki`, toàn bộ vault, hoặc bất kỳ đường dẫn con nào.
-7. **Bộ 12 LLM Tools dựng sẵn**:
-   - Cung cấp JSON Schema (`llm_tool_definitions()`) và hàm thực thi (`execute_llm_tool()`) cho Agent / MCP Server.
+7. **Bộ 15 LLM Tools dựng sẵn & Thực thi Thích ứng theo Context Window (`AdaptiveReadBudget`)**:
+   - Cung cấp JSON Schema (`llm_tool_definitions()`), hàm phân loại `is_read_only_wiki_tool()`, hàm thực thi JSON (`execute_llm_tool()`) và hàm thực thi tối ưu token theo `context_limit_tokens` (`execute_llm_tool_with_budget()`).
+   - Tích hợp cơ chế đọc phân trang theo dòng của `javis-os` (`slice_lines_with_budget`), danh mục gọn `read_compact_index_md` (kèm `aliases` chống phân mảnh trang), và tự động sửa lỗi thẻ đóng `</mermaid>`.
+8. **Tiện ích Mở rộng Flow đa nguồn (`write_topic_source`, `apply_template`, `build_next_autoflow_prompt`)**:
+   - Hỗ trợ sẵn chuẩn hóa tiếng Việt (`fold_vietnamese`, `slugify`, `sanitize_topic_folder`), chuyển đổi phụ đề `vtt_to_text`, lưu Raw Source theo chủ đề `<domain>/<topic>` (`write_topic_source`), bộ System Prompts đa tác tử (`ROOT_DISPATCHER_PROMPT`, `SOURCE_COLLECTOR_PROMPT`, `WIKI_INGESTOR_PROMPT`, `WIKI_CURATOR_PROMPT`) và hàm lập kế hoạch tự động `build_next_autoflow_prompt`.
 
 ## Chạy Kiểm Thử & Ví Dụ
 

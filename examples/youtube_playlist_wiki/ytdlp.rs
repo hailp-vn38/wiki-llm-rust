@@ -1,121 +1,10 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+pub(crate) use llm_wiki::{slugify, vtt_to_text};
 use orchestrator_agent_rs::ToolError;
 
 use crate::tools::tool_err;
-
-// ---------------------------------------------------------------------------
-// Tiện ích xử lý chuỗi & WebVTT
-// ---------------------------------------------------------------------------
-
-pub(crate) fn fold_vietnamese(c: char) -> char {
-    const GROUPS: [(&str, char); 7] = [
-        ("àáảãạăằắẳẵặâầấẩẫậÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬ", 'a'),
-        ("èéẻẽẹêềếểễệÈÉẺẼẸÊỀẾỂỄỆ", 'e'),
-        ("ìíỉĩịÌÍỈĨỊ", 'i'),
-        ("òóỏõọôồốổỗộơờớởỡợÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢ", 'o'),
-        ("ùúủũụưừứửữựÙÚỦŨỤƯỪỨỬỮỰ", 'u'),
-        ("ỳýỷỹỵỲÝỶỸỴ", 'y'),
-        ("đĐ", 'd'),
-    ];
-    GROUPS
-        .iter()
-        .find(|(set, _)| set.contains(c))
-        .map_or(c, |(_, r)| *r)
-}
-
-pub(crate) fn slugify(s: &str, max: usize) -> String {
-    let mut out = String::new();
-    for c in s.chars().map(fold_vietnamese) {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-        } else if !out.ends_with('-') && !out.is_empty() {
-            out.push('-');
-        }
-    }
-    let out: String = out.chars().take(max).collect();
-    let out = out.trim_matches('-').to_string();
-    if out.is_empty() {
-        "untitled".into()
-    } else {
-        out
-    }
-}
-
-/// Chuyển WebVTT sang văn bản thuần: bỏ header, timestamp, thẻ `<c>` và dòng lặp của auto-sub.
-pub(crate) fn vtt_to_text(vtt: &str) -> String {
-    let mut out: Vec<String> = Vec::new();
-    for raw in vtt.lines() {
-        let line = raw.trim();
-        if line.is_empty()
-            || line == "WEBVTT"
-            || line.contains("-->")
-            || line.starts_with("Kind:")
-            || line.starts_with("Language:")
-            || line.starts_with("NOTE")
-            || line.chars().all(|c| c.is_ascii_digit())
-        {
-            continue;
-        }
-        let mut text = String::new();
-        let mut in_tag = false;
-        for c in line.chars() {
-            match c {
-                '<' => in_tag = true,
-                '>' => in_tag = false,
-                _ if !in_tag => text.push(c),
-                _ => {}
-            }
-        }
-        let text = text
-            .replace("&amp;", "&")
-            .replace("&gt;", ">")
-            .replace("&lt;", "<")
-            .replace("&#39;", "'")
-            .replace("&quot;", "\"")
-            .trim()
-            .to_string();
-        if !text.is_empty() && out.last() != Some(&text) {
-            out.push(text);
-        }
-    }
-    // Gom các cue phụ đề thành các dòng văn bản dài ~120–140 ký tự (giống chuẩn đọc theo dòng `doc_theo_dong` của javis-os)
-    // để agent có thể đọc phân trang bằng `from_line` / `max_lines` thay vì dồn toàn bộ transcript vào 1 dòng khổng lồ.
-    let mut lines: Vec<String> = Vec::new();
-    let mut current_line = String::new();
-    for cue in out {
-        if current_line.is_empty() {
-            current_line.push_str(&cue);
-        } else if current_line.chars().count() + 1 + cue.chars().count() <= 130 {
-            current_line.push(' ');
-            current_line.push_str(&cue);
-        } else {
-            lines.push(std::mem::take(&mut current_line));
-            current_line.push_str(&cue);
-        }
-    }
-    if !current_line.is_empty() {
-        lines.push(current_line);
-    }
-    lines.join("\n")
-}
-
-pub(crate) fn clip_transcript(text: &str, max: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max {
-        return text.to_string();
-    }
-    let part = max / 3;
-    let mid = chars.len() / 2 - part / 2;
-    let seg = |a: usize| chars[a..a + part].iter().collect::<String>();
-    format!(
-        "{}\n[...lược bớt để vừa context window; bản đầy đủ nằm trong sources/...]\n{}\n[...lược bớt...]\n{}",
-        seg(0),
-        seg(mid),
-        seg(chars.len() - part)
-    )
-}
 
 // ---------------------------------------------------------------------------
 // Tích hợp yt-dlp (chạy trong spawn_blocking)
@@ -228,4 +117,3 @@ pub(crate) fn fetch_transcript(
     }
     Ok(text)
 }
-

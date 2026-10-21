@@ -85,10 +85,10 @@ llm-wiki-rs/
     ├── lib.rs                # Public exports: WikiEngine, WikiConfig, types, errors
     ├── config.rs             # WikiConfig (chỉ cần data_root, tự suy ra các path con)
     ├── error.rs              # WikiError (thiserror)
-    ├── fs/                   # Quản lý File System, Auto-mkdir, Tree Builder
+    ├── fs/                   # Quản lý File System, Auto-mkdir, Tree Builder, Adaptive Read Budget
     │   ├── mod.rs
     │   ├── path_guard.rs     # Chống Path Traversal, chuẩn hóa đường dẫn
-    │   ├── file_ops.rs       # write_nested_file (tạo folder lồng), read, delete, move
+    │   ├── file_ops.rs       # write_nested_file, slice_lines_with_budget, AdaptiveReadBudget, slugify, vtt_to_text
     │   └── tree.rs           # get_tree() cho sources, wiki, all + ASCII renderer
     ├── markdown/             # Xử lý Markdown theo chuẩn Obsidian & QMD
     │   ├── mod.rs
@@ -98,7 +98,7 @@ llm-wiki-rs/
     ├── db/                   # Tầng lưu trữ SQLite (rusqlite + FTS5 + sqlite-vec)
     │   ├── mod.rs
     │   ├── schema.rs         # Khởi tạo bảng & migrations
-    │   ├── index_store.rs    # CRUD bảng documents, chunks, links, metadata, contexts
+    │   ├── index_store.rs    # CRUD bảng documents, chunks, links, metadata, contexts (hỗ trợ tìm theo aliases & số)
     │   └── filter_sql.rs     # Biên dịch MetadataFilter AST sang câu lệnh SQL
     ├── search/               # Động cơ tìm kiếm QMD
     │   ├── mod.rs
@@ -108,18 +108,25 @@ llm-wiki-rs/
     │   └── metadata.rs       # Metadata Discovery & Filtering
     ├── graph/                # Tương thích Obsidian Graph View
     │   ├── mod.rs
-    │   ├── link_resolver.rs  # Giải quyết [[WikiLink]] theo chuẩn Shortest-path của Obsidian
+    │   ├── link_resolver.rs  # Giải quyết [[WikiLink]] theo chuẩn Shortest-path + Aliases của Obsidian
     │   └── analysis.rs       # Backlinks, Outgoing links, Orphans, Hubs, Broken links
+    ├── prompts/              # Prompt Builders, Domain Templates & Multi-Subagent System Prompts
+    │   ├── mod.rs
+    │   ├── ingest.rs         # Prompt & block parsers cho luồng Ingest 2 pha
+    │   ├── query_lint.rs     # Prompt cho Query, Synthesis & Semantic Lint
+    │   ├── language.rs       # Nhận diện và chỉ thị ngôn ngữ đầu ra
+    │   ├── templates.rs      # Bộ 5 Domain Templates (Research, Personal, Team, Course, Book)
+    │   └── subagents.rs      # Bộ 4 Universal Multi-Subagent Prompts (root, source_collector, wiki_ingestor, wiki_curator)
     ├── wiki/                 # Nghiệp vụ LLM Wiki (Karpathy pattern)
     │   ├── mod.rs
-    │   ├── ingest.rs         # Luồng Ingest source (giữ nguyên tên file source)
-    │   ├── index_md.rs       # Tự động đọc/cập nhật wiki/index.md
+    │   ├── ingest.rs         # Luồng Ingest source (giữ nguyên tên file source) & WriteTopicSourceRequest
+    │   ├── index_md.rs       # Tự động đọc/cập nhật wiki/index.md & generate_compact_index_md
     │   ├── log_md.rs         # Append & parse wiki/log.md (`## [YYYY-MM-DD] op | title`)
     │   └── linter.rs         # Kiểm tra sức khỏe Wiki (Orphans, Broken links, Un-ingested...)
-    └── tools/                # Tích hợp Tool Calling cho LLM / MCP
+    └── tools/                # Tích hợp Tool Calling cho LLM / MCP (15 Tools)
         ├── mod.rs
-        ├── definitions.rs    # JSON Schema của các tools
-        └── executor.rs       # Bộ thực thi tool từ JSON input -> JSON output
+        ├── definitions.rs    # JSON Schema của 15 tools & is_read_only_wiki_tool
+        └── executor.rs       # execute_tool_call & execute_tool_call_with_budget (AdaptiveReadBudget)
 ```
 
 ### `Cargo.toml` Đề Xuất
@@ -660,6 +667,8 @@ impl WikiEngine {
     pub fn open_with_config(config: WikiConfig) -> Result<Self, WikiError>;
     pub fn with_embedder(self, embedder: std::sync::Arc<dyn EmbeddingProvider>) -> Self;
     pub fn with_reranker(self, reranker: std::sync::Arc<dyn RerankProvider>) -> Self;
+    /// Áp dụng bộ `WikiTemplateId` (`Research`, `Personal`, `Team`, `Course`, `Book`) kèm đăng ký 5 QMD Path Contexts chuẩn.
+    pub fn apply_template(&self, template_id: WikiTemplateId) -> Result<WikiTemplate, WikiError>;
 
     // =========================================================================
     // 2. QUẢN LÝ FILE & TỰ ĐỘNG TẠO THƯ MỤC LỒNG NHAU (Yêu cầu #6, #7, #8)
@@ -667,6 +676,9 @@ impl WikiEngine {
     /// Tạo hoặc ghi đè file trong `sources/`. Hỗ trợ đường dẫn lồng như `"docs/flow/lib.md"`
     /// -> Tự động tạo folder `sources/docs` và `sources/docs/flow`, ghi `lib.md` và index vào DB.
     pub fn write_source_file(&self, rel_path: &str, content: &str) -> Result<DocumentInfo, WikiError>;
+
+    /// Tạo Raw Source chuẩn hóa theo thư mục chủ đề `<domain>/<topic>/<file_stem>.md` kèm YAML frontmatter + `qmd.metadata`.
+    pub fn write_topic_source(&self, req: WriteTopicSourceRequest) -> Result<WriteTopicSourceResponse, WikiError>;
 
     /// Tạo hoặc ghi đè trang trong `wiki/`. Hỗ trợ đường dẫn lồng như `"concepts/search/bm25.md"`
     /// -> Tự động tạo folder `wiki/concepts/search`, ghi `bm25.md`, index vào DB & cập nhật Graph.
@@ -700,8 +712,9 @@ impl WikiEngine {
     /// Trả về đường dẫn trang Wiki tương ứng với một đường dẫn Source (giữ nguyên tên file).
     pub fn resolve_wiki_path_for_source(&self, source_rel_path: &str) -> Result<String, WikiError>;
 
-    /// Đọc hoặc tái tạo/cập nhật file `wiki/index.md` dựa trên danh mục trang hiện có.
+    /// Đọc hoặc tái tạo/cập nhật file `wiki/index.md` (hoặc Compact Index giới hạn ký tự `read_compact_index_md`).
     pub fn read_index_md(&self) -> Result<String, WikiError>;
+    pub fn read_compact_index_md(&self, max_chars: usize) -> Result<String, WikiError>;
     pub fn rebuild_or_sync_index_md(&self) -> Result<String, WikiError>;
 
     /// Ghi thêm một dòng nhật ký chuẩn `## [YYYY-MM-DD HH:MM] <action> | <title>` vào `wiki/log.md`.
@@ -761,13 +774,19 @@ impl WikiEngine {
     pub fn resolve_wikilink(&self, wikilink_target: &str, from_rel_path: Option<&str>) -> Result<Option<DocumentInfo>, WikiError>;
 
     // =========================================================================
-    // 6. TÍCH HỢP TOOL CHO LLM AGENT / MCP (Yêu cầu #5)
+    // 6. TÍCH HỢP TOOL CHO LLM AGENT / MCP & REACTIVE AUTO-FLOW (Yêu cầu #5)
     // =========================================================================
-    /// Trả về danh sách định nghĩa tất cả các Tools kèm JSON Schema (chuẩn OpenAI / Anthropic / MCP).
+    /// Trả về danh sách định nghĩa tất cả 15 Tools kèm JSON Schema (chuẩn OpenAI / Anthropic / MCP).
     pub fn llm_tool_definitions(&self) -> Vec<LlmToolSpec>;
 
     /// Thực thi một Tool theo tên và tham số JSON từ LLM, trả về JSON kết quả.
     pub fn execute_llm_tool(&self, tool_name: &str, arguments: serde_json::Value) -> Result<serde_json::Value, WikiError>;
+
+    /// Thực thi Tool kèm cơ chế phân trang thích ứng (`AdaptiveReadBudget`) trả về `LlmToolOutcome` tối ưu token.
+    pub fn execute_llm_tool_with_budget(&self, tool_name: &str, arguments: serde_json::Value, read_budget: AdaptiveReadBudget) -> Result<LlmToolOutcome, WikiError>;
+
+    /// Kiểm tra trạng thái đĩa (`sources/` vs `wiki/`) để sinh prompt điều phối Reactive Auto-Flow tiếp theo.
+    pub fn build_next_autoflow_prompt(&self, initial_collection_prompt: Option<&str>) -> Result<Option<String>, WikiError>;
 }
 ```
 
@@ -775,21 +794,22 @@ impl WikiEngine {
 
 ## 7. Chi Tiết Bộ Tools Cho LLM Sử Dụng (Yêu cầu #5)
 
-Module `src/tools/` đóng gói sẵn **12 Tools chuyên biệt** kết hợp cả 5 công cụ tìm kiếm của QMD (`query`, `get`, `multi_get`, `metadata`, `status`) và 7 công cụ vận hành LLM Wiki (`tree`, `write_file`, `ingest_source`, `patch_file`, `graph_neighbors`, `lint`, `log`).
+Module `src/tools/` đóng gói sẵn **15 Tools chuyên biệt** kết hợp cả 5 công cụ tìm kiếm của QMD (`query`, `get`, `multi_get`, `metadata`, `status`) và 10 công cụ vận hành LLM Wiki (`tree`, `write_file`, `patch_file`, `ingest_source`, `graph_neighbors`, `lint`, `log`, `file_synthesis`, `schema`, `delete_file`).
 
-Bất kỳ framework LLM nào (OpenAI Function Calling, Claude Tool Use, Gemini Function Declarations, MCP Server `rmcp`, hoặc `rig-core`) chỉ cần gọi:
+Bất kỳ framework LLM nào (OpenAI Function Calling, Claude Tool Use, Gemini Function Declarations, MCP Server `rmcp`, hoặc `orchestrator-agent-rs`) chỉ cần gọi:
 ```rust
 let tools = engine.llm_tool_definitions();
-let tool_output = engine.execute_llm_tool(&call.name, call.arguments)?;
+let read_budget = AdaptiveReadBudget::for_context_limit(200_000);
+let outcome = engine.execute_llm_tool_with_budget(&call.name, call.arguments, read_budget)?;
 ```
 
-### Danh Sách 12 LLM Tools & JSON Schema
+### Danh Sách 15 LLM Tools & JSON Schema
 
 | Tên Tool | Nguồn gốc | Chức năng chính cho LLM |
 |---|---|---|
 | `wiki_tree` | Yêu cầu #7 | Lấy cây thư mục của `sources`, `wiki`, hoặc toàn bộ vault (trả về cả JSON lẫn ASCII tree). |
 | `wiki_query` | QMD `query` | Tìm kiếm Hybrid (`lex` BM25 + `vec` Semantic + `hyde` + Metadata Filter + RRF Fusion). |
-| `wiki_get` | QMD `get` | Đọc nội dung file theo đường dẫn hoặc `#docid`, hỗ trợ đọc theo khoảng dòng (`from_line`, `max_lines`). |
+| `wiki_get` | QMD `get` | Đọc nội dung file theo đường dẫn hoặc `#docid`, hỗ trợ đọc phân trang theo khoảng dòng (`from_line`, `max_lines`) và `AdaptiveReadBudget`. |
 | `wiki_multi_get` | QMD `multi_get` | Đọc hàng loạt file cùng lúc qua glob pattern (`wiki/entities/*.md`) hoặc danh sách `#docid`. |
 | `wiki_metadata` | QMD `metadata` | Khám phá các trường YAML frontmatter metadata và tần suất giá trị để viết bộ lọc chính xác. |
 | `wiki_status` | QMD `status` | Xem thống kê số file trong `sources/`, `wiki/`, số liên kết đồ thị, các key metadata phổ biến. |
@@ -799,6 +819,9 @@ let tool_output = engine.execute_llm_tool(&call.name, call.arguments)?;
 | `wiki_graph_neighbors`| Obsidian #2 | Xem tất cả Backlinks (trang trỏ tới) và Outgoing Links (trang đi ra) của một trang để LLM đan chéo `[[WikiLinks]]`. |
 | `wiki_lint` | Karpathy Lint | Chạy kiểm tra sức khỏe Wiki: liệt kê các file `sources/` chưa được tạo trang `wiki/`, các `[[WikiLinks]]` chưa có trang đích, và các trang mồ côi (Orphans). |
 | `wiki_log` | Karpathy Log | Đọc lịch sử hoạt động gần nhất hoặc ghi thêm bản ghi vào `wiki/log.md`. |
+| `wiki_file_synthesis` | Karpathy Query | Lưu câu trả lời / bảng so sánh / bài tổng hợp xuyên nguồn vào `wiki/syntheses/`. |
+| `wiki_schema` | Karpathy Schema | Đọc hoặc cập nhật quy ước `SCHEMA.md` của Knowledge Base. |
+| `wiki_delete_file` | Wiki Curate | Xóa trang trùng lặp hoặc lỗi thời trong `wiki/` (hoặc `sources/`), tự động cập nhật `wiki/index.md` và đồ thị liên kết. |
 
 ### Đặc Tả JSON Schema Mẫu Của Các Tools Quan Trọng (`src/tools/definitions.rs`)
 

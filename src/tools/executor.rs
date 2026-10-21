@@ -1,5 +1,6 @@
 use crate::db::filter_sql::MetadataFilter;
 use crate::error::{WikiError, WikiResult};
+use crate::fs::file_ops::{sanitize_mermaid_fences, slice_lines_with_budget, AdaptiveReadBudget};
 use crate::fs::tree::{TreeOptions, TreeScope};
 use crate::search::metadata::MetadataDiscoveryRequest;
 use crate::search::{HybridQueryRequest, SubQuery};
@@ -7,10 +8,40 @@ use crate::types::{CollectionScope, GetOptions, MultiGetOptions};
 use crate::wiki::ingest::{FileSynthesisRequest, IngestSourceRequest};
 use crate::wiki::log_md::LogAction;
 use crate::WikiEngine;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-/// Execute one of the 12 LLM tools by name with JSON arguments and return a structured JSON response.
-pub fn execute_tool_call(engine: &WikiEngine, tool_name: &str, args: Value) -> WikiResult<Value> {
+/// Compact, token-optimized outcome returned by `execute_tool_call_with_budget`
+/// for LLM agent/subagent tool loops (with adaptive line-bounded reading, compact `wiki/index.md`,
+/// automatic Mermaid fence sanitization, and human-readable progress messages).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmToolOutcome {
+    /// Formatted text content to return directly to the LLM as the tool result.
+    pub content: String,
+    /// Structured JSON metadata associated with the tool execution.
+    pub metadata: Value,
+    /// Optional human-readable progress message (e.g. for agent event streams).
+    pub progress_message: Option<String>,
+}
+
+/// Execute one of the 13 LLM tools by name with JSON arguments and return a structured JSON response.
+pub fn execute_tool_call(engine: &WikiEngine, tool_name: &str, mut args: Value) -> WikiResult<Value> {
+    if let Some(obj) = args.as_object_mut() {
+        for field in [
+            "wiki_markdown_body",
+            "content",
+            "append_text",
+            "replacement_text",
+            "markdown_body",
+        ] {
+            if let Some(Value::String(s)) = obj.get_mut(field) {
+                if s.contains("</mermaid>") {
+                    *s = sanitize_mermaid_fences(s);
+                }
+            }
+        }
+    }
+
     match tool_name {
         "wiki_tree" => {
             let scope_str = args.get("scope").and_then(|v| v.as_str()).unwrap_or("all");
@@ -463,7 +494,253 @@ pub fn execute_tool_call(engine: &WikiEngine, tool_name: &str, args: Value) -> W
             }
         }
 
+        "wiki_delete_file" => {
+            let scope_str = args.get("scope").and_then(|v| v.as_str()).unwrap_or("wiki");
+            let scope = CollectionScope::from_str_opt(scope_str).ok_or_else(|| {
+                WikiError::InvalidToolArguments {
+                    tool: tool_name.to_string(),
+                    message: format!("Invalid scope '{scope_str}', expected 'wiki' or 'sources'"),
+                }
+            })?;
+            let rel_path = args
+                .get("rel_path")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| WikiError::InvalidToolArguments {
+                    tool: tool_name.to_string(),
+                    message: "Missing required string parameter `rel_path`".to_string(),
+                })?;
+            let deleted = engine.delete_file(scope, rel_path)?;
+            if scope == CollectionScope::Wiki {
+                let _ = engine.rebuild_or_sync_index_md();
+            }
+            Ok(json!({
+                "deleted": deleted,
+                "rel_path": rel_path,
+            }))
+        }
+
         other => Err(WikiError::UnknownTool(other.to_string())),
+    }
+}
+
+/// Execute an LLM tool with adaptive token-budgeted reading (`AdaptiveReadBudget`),
+/// compact `wiki/index.md` rendering, frontmatter stripping on `sources/...`,
+/// automatic embedding/index refresh before `wiki_lint`, and compact response formatting.
+pub fn execute_tool_call_with_budget(
+    engine: &WikiEngine,
+    tool_name: &str,
+    args: Value,
+    read_budget: AdaptiveReadBudget,
+) -> WikiResult<LlmToolOutcome> {
+    if tool_name == "wiki_lint" {
+        let _ = engine.embed_pending(false);
+        let _ = engine.rebuild_or_sync_index_md();
+    }
+
+    if tool_name == "wiki_get" {
+        let file = args
+            .get("file")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| WikiError::InvalidToolArguments {
+                tool: tool_name.to_string(),
+                message: "Missing required string parameter `file`".to_string(),
+            })?;
+        let from_line = args
+            .get("from_line")
+            .or_else(|| args.get("fromLine"))
+            .and_then(Value::as_u64)
+            .map(|n| n as usize);
+        let max_lines = args
+            .get("max_lines")
+            .or_else(|| args.get("maxLines"))
+            .and_then(Value::as_u64)
+            .map(|n| n as usize);
+        let line_numbers = args
+            .get("line_numbers")
+            .or_else(|| args.get("lineNumbers"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let clean_file = file.trim().trim_start_matches('/');
+        if (clean_file.eq_ignore_ascii_case("wiki/index.md")
+            || clean_file.eq_ignore_ascii_case("index.md"))
+            && from_line.is_none()
+        {
+            let full_idx = engine.read_index_md()?;
+            let body = if full_idx.chars().count() <= read_budget.compact_index_max_chars {
+                full_idx
+            } else {
+                engine.read_compact_index_md(read_budget.compact_index_max_chars)?
+            };
+            return Ok(LlmToolOutcome {
+                content: format!("FILE: wiki/index.md\n\n{body}"),
+                metadata: json!({ "rel_path": "wiki/index.md" }),
+                progress_message: None,
+            });
+        }
+
+        // For raw source files (`sources/...`), the `# Title` and bullet header already carry
+        // the essential metadata, so skip the 30-line YAML frontmatter + `qmd.metadata` block.
+        let include_frontmatter = !clean_file.starts_with("sources/");
+        let doc = engine.get_document(
+            file,
+            GetOptions {
+                from_line: None,
+                max_lines: None,
+                line_numbers: false,
+                include_frontmatter,
+            },
+        )?;
+
+        let effective_max_lines = Some(max_lines.unwrap_or(read_budget.default_lines));
+        let bounded = slice_lines_with_budget(
+            &doc.content,
+            from_line,
+            effective_max_lines,
+            Some(read_budget.max_window_chars),
+            line_numbers,
+        );
+
+        return Ok(LlmToolOutcome {
+            content: format!(
+                "FILE: {} (docid: {}, total_lines: {})\n\n{}",
+                doc.info.rel_path, doc.info.docid, doc.info.line_count, bounded
+            ),
+            metadata: json!({
+                "rel_path": doc.info.rel_path,
+                "docid": doc.info.docid,
+                "line_count": doc.info.line_count,
+            }),
+            progress_message: None,
+        });
+    }
+
+    let res = execute_tool_call(engine, tool_name, args)?;
+
+    match tool_name {
+        "wiki_tree" => {
+            let ascii = res.get("ascii_tree").and_then(Value::as_str).unwrap_or("");
+            Ok(LlmToolOutcome {
+                content: ascii.to_string(),
+                metadata: json!({ "total_files": res.get("total_files") }),
+                progress_message: None,
+            })
+        }
+        "wiki_lint" => {
+            let is_healthy = res
+                .get("is_healthy")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let broken_arr = res
+                .get("broken_links")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let orphans_arr = res
+                .get("orphan_wiki_pages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let uningested_arr = res
+                .get("uningested_sources")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let broken = broken_arr.len();
+            let orphans = orphans_arr.len();
+            let _ = engine.append_log(
+                LogAction::Lint,
+                "Subagent executed wiki_lint health-check",
+                &[format!(
+                    "is_healthy={is_healthy}, broken_links={broken}, orphan_wiki_pages={orphans}"
+                )],
+            );
+            let compact = json!({
+                "is_healthy": is_healthy,
+                "uningested_sources": uningested_arr,
+                "broken_links": broken_arr,
+                "orphan_wiki_pages": orphans_arr,
+            });
+            let pretty = serde_json::to_string_pretty(&compact).unwrap_or_default();
+            Ok(LlmToolOutcome {
+                content: pretty,
+                metadata: compact,
+                progress_message: Some(format!(
+                    "Wiki Lint: is_healthy={is_healthy}, broken_links={broken}, orphans={orphans}"
+                )),
+            })
+        }
+        "wiki_ingest_source" => {
+            if let Some(p) = res.get("wiki_rel_path").and_then(Value::as_str) {
+                let docid = res.get("wiki_docid").and_then(Value::as_str).unwrap_or("");
+                let msg = format!("Đã ingest trang Wiki: `{p}`");
+                return Ok(LlmToolOutcome {
+                    content: format!("Ingested `{p}` (docid: {docid})"),
+                    metadata: res,
+                    progress_message: Some(msg),
+                });
+            }
+            let pretty = serde_json::to_string_pretty(&res).unwrap_or_else(|_| res.to_string());
+            Ok(LlmToolOutcome {
+                content: pretty,
+                metadata: res,
+                progress_message: None,
+            })
+        }
+        "wiki_write_file" | "wiki_patch_file" => {
+            if let Some(p) = res.get("rel_path").and_then(Value::as_str) {
+                let docid = res.get("docid").and_then(Value::as_str).unwrap_or("");
+                let msg = format!("Đã cập nhật file Wiki: `{p}`");
+                return Ok(LlmToolOutcome {
+                    content: format!("Updated `{p}` (docid: {docid})"),
+                    metadata: res,
+                    progress_message: Some(msg),
+                });
+            }
+            let pretty = serde_json::to_string_pretty(&res).unwrap_or_else(|_| res.to_string());
+            Ok(LlmToolOutcome {
+                content: pretty,
+                metadata: res,
+                progress_message: None,
+            })
+        }
+        "wiki_file_synthesis" => {
+            if let Some(p) = res.get("rel_path").and_then(Value::as_str) {
+                let docid = res.get("docid").and_then(Value::as_str).unwrap_or("");
+                let msg = format!("Đã lưu trang Synthesis: `{p}`");
+                return Ok(LlmToolOutcome {
+                    content: format!("Filed synthesis `{p}` (docid: {docid})"),
+                    metadata: res,
+                    progress_message: Some(msg),
+                });
+            }
+            let pretty = serde_json::to_string_pretty(&res).unwrap_or_else(|_| res.to_string());
+            Ok(LlmToolOutcome {
+                content: pretty,
+                metadata: res,
+                progress_message: None,
+            })
+        }
+        "wiki_delete_file" => {
+            let deleted = res.get("deleted").and_then(Value::as_bool).unwrap_or(false);
+            let rel_path = res.get("rel_path").and_then(Value::as_str).unwrap_or("");
+            let msg = format!("Đã xóa file Wiki `{rel_path}` (deleted={deleted})");
+            Ok(LlmToolOutcome {
+                content: format!("deleted={deleted} path={rel_path}"),
+                metadata: res,
+                progress_message: Some(msg),
+            })
+        }
+        _ => {
+            let pretty = serde_json::to_string_pretty(&res).unwrap_or_else(|_| res.to_string());
+            Ok(LlmToolOutcome {
+                content: pretty,
+                metadata: res,
+                progress_message: None,
+            })
+        }
     }
 }
 

@@ -24,8 +24,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use llm_wiki::prompts::{get_wiki_template, WikiTemplateId};
-use llm_wiki::{CollectionScope, WikiEngine};
+use llm_wiki::prompts::WikiTemplateId;
+use llm_wiki::{is_read_only_wiki_tool, WikiEngine};
 use orchestrator_agent_rs::{
     AgentDefinition, AgentMode, LlmBackend, LlmConfig, LlmProviderConfig, Orchestrator,
     OrchestratorConfig, ProviderAuth, SecretString, ToolEffect,
@@ -36,8 +36,7 @@ use prompts::{
 };
 use runner::{resolve_llm_credentials, run_orchestrator_turn, verify_vault_on_disk};
 use tools::{
-    AdaptiveReadBudget, SharedEnv, WikiDeleteFileTool, WikiEngineBridgeTool, YtFetchTranscriptTool,
-    YtListPlaylistTool,
+    AdaptiveReadBudget, SharedEnv, WikiEngineBridgeTool, YtFetchTranscriptTool, YtListPlaylistTool,
 };
 
 pub(crate) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -101,33 +100,7 @@ async fn main() -> Result<()> {
 
     // 1. Khởi tạo `WikiEngine` với chuẩn Universal Template (`WikiTemplateId::Research`)
     let engine = Arc::new(WikiEngine::open(&vault_dir)?);
-    let template = get_wiki_template(WikiTemplateId::Research);
-    engine.set_schema_md(&template.schema_md)?;
-    engine.set_path_context(
-        Some(CollectionScope::Sources),
-        "/",
-        "Raw immutable source documents organized by topic folder (<domain>/<topic>)",
-    )?;
-    engine.set_path_context(
-        Some(CollectionScope::Wiki),
-        "/sources",
-        "Compiled source summary wiki pages preserving raw source filenames and topic folders",
-    )?;
-    engine.set_path_context(
-        Some(CollectionScope::Wiki),
-        "/entities",
-        "Canonical entity pages (people, platforms, languages, tools, datasets)",
-    )?;
-    engine.set_path_context(
-        Some(CollectionScope::Wiki),
-        "/concepts",
-        "Canonical concept pages (strategies, algorithms, architectural patterns, methods)",
-    )?;
-    engine.set_path_context(
-        Some(CollectionScope::Wiki),
-        "/syntheses",
-        "Cross-source comparative syntheses, tables, and knowledge maps",
-    )?;
+    engine.apply_template(WikiTemplateId::Research)?;
 
     println!("=== Khởi tạo Multi-Subagent LLM Wiki (Topic Source Collection + Reactive Auto-Ingest) ===");
     println!("- Playlist URL : {playlist_url}");
@@ -262,23 +235,20 @@ async fn main() -> Result<()> {
     orch_cfg.runtime.compaction_keep_recent = 6;
     orch_cfg.runtime.tool_output_cap_bytes = (read_budget.max_window_chars * 3 / 2).max(24 * 1024);
 
-    // 4. Đăng ký YouTube tools + toàn bộ native tools của `WikiEngine`
+    // 4. Đăng ký YouTube tools + toàn bộ 13 native tools của `WikiEngine`
     let mut builder = Orchestrator::builder(orch_cfg)
         .register_tool(Arc::new(YtListPlaylistTool {
             env: shared_env.clone(),
         }))
         .register_tool(Arc::new(YtFetchTranscriptTool {
             env: shared_env.clone(),
-        }))
-        .register_tool(Arc::new(WikiDeleteFileTool {
-            engine: engine.clone(),
         }));
 
     for spec in engine.llm_tool_definitions() {
-        let effect = match spec.name.as_str() {
-            "wiki_tree" | "wiki_query" | "wiki_get" | "wiki_multi_get" | "wiki_metadata"
-            | "wiki_status" | "wiki_graph_neighbors" => ToolEffect::ReadOnly,
-            _ => ToolEffect::Mutating,
+        let effect = if is_read_only_wiki_tool(&spec.name) {
+            ToolEffect::ReadOnly
+        } else {
+            ToolEffect::Mutating
         };
         builder = builder.register_tool(Arc::new(WikiEngineBridgeTool {
             engine: engine.clone(),

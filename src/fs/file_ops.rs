@@ -1,5 +1,6 @@
 use crate::error::WikiResult;
 use crate::fs::path_guard::resolve_safe_path;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Write `content` to `relative_path` inside `base_dir`, automatically creating all intermediate
@@ -188,4 +189,200 @@ pub fn slice_lines_with_budget(
     }
 
     out
+}
+
+/// Adaptive read window configuration for `wiki_get` based on the LLM's `context_limit_tokens`:
+/// - **Small models (`<= 16K` tokens)**: `110 lines / 5,200 chars`, compact index `3,200 chars`.
+/// - **Medium models (`16K..=64K` tokens)**: `220 lines / 16,000 chars`, compact index `6,000 chars`.
+/// - **Large models (`> 64K` tokens, e.g. 200K)**: `400 lines / 36,000 chars` (~9K tokens), compact index `12,000 chars`
+///   (reads 95% of documents in a single turn while preventing "Lost in the Middle" on book-length files).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdaptiveReadBudget {
+    pub default_lines: usize,
+    pub max_window_chars: usize,
+    pub compact_index_max_chars: usize,
+}
+
+impl Default for AdaptiveReadBudget {
+    fn default() -> Self {
+        Self::for_context_limit(200_000)
+    }
+}
+
+impl AdaptiveReadBudget {
+    pub fn for_context_limit(context_limit_tokens: usize) -> Self {
+        if context_limit_tokens <= 16_000 {
+            Self {
+                default_lines: 110,
+                max_window_chars: 5_200,
+                compact_index_max_chars: 3_200,
+            }
+        } else if context_limit_tokens <= 64_000 {
+            Self {
+                default_lines: 220,
+                max_window_chars: 16_000,
+                compact_index_max_chars: 6_000,
+            }
+        } else {
+            Self {
+                default_lines: 400,
+                max_window_chars: 36_000,
+                compact_index_max_chars: 12_000,
+            }
+        }
+    }
+}
+
+/// Fold a Vietnamese diacritic character to its ASCII equivalent (`đ -> d`, `ă/â -> a`, etc.).
+pub fn fold_vietnamese(c: char) -> char {
+    const GROUPS: [(&str, char); 7] = [
+        ("àáảãạăằắẳẵặâầấẩẫậÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬ", 'a'),
+        ("èéẻẽẹêềếểễệÈÉẺẼẸÊỀẾỂỄỆ", 'e'),
+        ("ìíỉĩịÌÍỈĨỊ", 'i'),
+        ("òóỏõọôồốổỗộơờớởỡợÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢ", 'o'),
+        ("ùúủũụưừứửữựÙÚỦŨỤƯỪỨỬỮỰ", 'u'),
+        ("ỳýỷỹỵỲÝỶỸỴ", 'y'),
+        ("đĐ", 'd'),
+    ];
+    GROUPS
+        .iter()
+        .find(|(set, _)| set.contains(c))
+        .map_or(c, |(_, r)| *r)
+}
+
+/// Convert an arbitrary title/string (including Vietnamese diacritics) into a clean `kebab-case` slug
+/// truncated to `max` characters.
+pub fn slugify(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    for c in s.chars().map(fold_vietnamese) {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+    }
+    let out: String = out.chars().take(max).collect();
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "untitled".into()
+    } else {
+        out
+    }
+}
+
+/// Sanitize a topic folder path inside `sources/` into `<domain>/<topic>` in `kebab-case` (max 2 levels).
+pub fn sanitize_topic_folder(raw: &str) -> String {
+    let trimmed = raw
+        .trim()
+        .trim_matches('/')
+        .strip_prefix("sources/")
+        .unwrap_or(raw.trim().trim_matches('/'));
+    let segments: Vec<String> = trimmed
+        .split('/')
+        .filter(|s| !s.trim().is_empty() && *s != "." && *s != "..")
+        .take(2)
+        .map(|s| slugify(s, 36))
+        .collect();
+    if segments.is_empty() {
+        "general".to_string()
+    } else {
+        segments.join("/")
+    }
+}
+
+/// Automatically replace malformed `</mermaid>` closing tags with standard CommonMark ```` ``` ```` fences.
+pub fn sanitize_mermaid_fences(md: &str) -> String {
+    if !md.contains("</mermaid>") && !md.contains("</MERMAID>") {
+        return md.to_string();
+    }
+    let mut out = md
+        .lines()
+        .map(|line| {
+            if line.trim().eq_ignore_ascii_case("</mermaid>") {
+                "```"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if md.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Convert raw WebVTT subtitle content into clean multi-line text (~130 chars per line) suitable for
+/// line-bounded pagination (`slice_lines_with_budget`).
+pub fn vtt_to_text(vtt: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for raw in vtt.lines() {
+        let line = raw.trim();
+        if line.is_empty()
+            || line == "WEBVTT"
+            || line.contains("-->")
+            || line.starts_with("Kind:")
+            || line.starts_with("Language:")
+            || line.starts_with("NOTE")
+            || line.chars().all(|c| c.is_ascii_digit())
+        {
+            continue;
+        }
+        let mut text = String::new();
+        let mut in_tag = false;
+        for c in line.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                _ if !in_tag => text.push(c),
+                _ => {}
+            }
+        }
+        let text = text
+            .replace("&amp;", "&")
+            .replace("&gt;", ">")
+            .replace("&lt;", "<")
+            .replace("&#39;", "'")
+            .replace("&quot;", "\"")
+            .trim()
+            .to_string();
+        if !text.is_empty() && out.last() != Some(&text) {
+            out.push(text);
+        }
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut current_line = String::new();
+    for cue in out {
+        if current_line.is_empty() {
+            current_line.push_str(&cue);
+        } else if current_line.chars().count() + 1 + cue.chars().count() <= 130 {
+            current_line.push(' ');
+            current_line.push_str(&cue);
+        } else {
+            lines.push(std::mem::take(&mut current_line));
+            current_line.push_str(&cue);
+        }
+    }
+    if !current_line.is_empty() {
+        lines.push(current_line);
+    }
+    lines.join("\n")
+}
+
+/// Produce a 3-part (head / middle / tail) preview of a long transcript or document capped at `max` characters.
+pub fn clip_transcript(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_string();
+    }
+    let part = max / 3;
+    let mid = chars.len() / 2 - part / 2;
+    let seg = |a: usize| chars[a..a + part].iter().collect::<String>();
+    format!(
+        "{}\n[...lược bớt để vừa context window; bản đầy đủ nằm trong sources/...]\n{}\n[...lược bớt...]\n{}",
+        seg(0),
+        seg(mid),
+        seg(chars.len() - part)
+    )
 }

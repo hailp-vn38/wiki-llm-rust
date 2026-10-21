@@ -6,6 +6,7 @@
 pub mod ingest;
 pub mod language;
 pub mod query_lint;
+pub mod subagents;
 pub mod templates;
 
 pub use ingest::{
@@ -25,6 +26,9 @@ pub use query_lint::{
     build_evidence_quality_gate_system_prompt, build_query_agent_system_prompt,
     build_research_synthesis_prompt, build_semantic_lint_prompt, parse_semantic_lint_blocks,
     ParsedSemanticLintBlock, SemanticLintIssueType, WikiRetrievalMode, WikilinkSubstitution,
+};
+pub use subagents::{
+    ROOT_DISPATCHER_PROMPT, SOURCE_COLLECTOR_PROMPT, WIKI_CURATOR_PROMPT, WIKI_INGESTOR_PROMPT,
 };
 pub use templates::{all_wiki_templates, get_wiki_template, WikiTemplate, WikiTemplateId};
 

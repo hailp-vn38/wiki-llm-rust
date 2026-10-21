@@ -1,6 +1,8 @@
 use crate::config::{WikiConfig, WikiSourceLayout};
 use crate::error::{WikiError, WikiResult};
+use crate::fs::file_ops::{sanitize_mermaid_fences, sanitize_topic_folder, slugify};
 use crate::fs::path_guard::ensure_markdown_extension;
+use crate::types::DocumentInfo;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -195,7 +197,8 @@ pub fn render_source_wiki_markdown(
         req.one_line_summary.trim()
     ));
 
-    out.push_str(req.wiki_markdown_body.trim());
+    let clean_body = sanitize_mermaid_fences(req.wiki_markdown_body.trim());
+    out.push_str(&clean_body);
     out.push('\n');
 
     // Append explicit Related Entities / Concepts links if not already mentioned in body
@@ -304,7 +307,137 @@ pub fn render_synthesis_markdown(req: &FileSynthesisRequest) -> String {
         req.query.trim(),
         req.one_line_summary.trim()
     ));
-    out.push_str(req.markdown_body.trim());
+    let clean_body = sanitize_mermaid_fences(req.markdown_body.trim());
+    out.push_str(&clean_body);
     out.push('\n');
     out
+}
+
+/// Request to write a categorized raw source file into `sources/<domain>/<topic>/<file_stem>.md`
+/// with 3-facet hierarchical tags and QMD metadata. Reusable across YouTube, Web, PDF, and Repo flows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteTopicSourceRequest {
+    /// Topic folder path (e.g. `"algo-trading/mql5-dca"`). Automatically sanitized to `<domain>/<topic>`.
+    pub topic_folder: String,
+    /// Optional explicit file stem (e.g. `"01-intro-to-pd-arrays"`). If `None`, derived from `title` via `slugify`.
+    pub file_stem: Option<String>,
+    /// Human-readable title of the raw source.
+    pub title: String,
+    /// Main raw body / transcript / extracted text.
+    pub raw_body: String,
+    /// Optional section heading before `raw_body` (defaults to `"Raw Content"`).
+    pub body_heading: Option<String>,
+    /// Hierarchical and domain tags (e.g. `["mql5", "mt5"]`). `"wiki/source"` and `"topic/<topic_folder>"` are added automatically.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Optional extra frontmatter key-value pairs (e.g. `[("video_id", json!("abc")), ("playlist_index", json!(1))]`).
+    #[serde(default)]
+    pub extra_frontmatter: Vec<(String, serde_json::Value)>,
+    /// Optional human-readable metadata bullet lines in the Markdown header (`(label, value)`).
+    #[serde(default)]
+    pub header_bullets: Vec<(String, String)>,
+    /// Maximum characters for the short preview returned in `WriteTopicSourceResponse::agent_output` (defaults to `600`).
+    pub preview_chars: Option<usize>,
+}
+
+/// Result of saving a categorized raw source via `WikiEngine::write_topic_source`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteTopicSourceResponse {
+    /// Indexed `DocumentInfo` of the created raw source file.
+    pub info: DocumentInfo,
+    /// Sanitized `<domain>/<topic>` folder path.
+    pub topic_folder: String,
+    /// Extracted top-level `domain`.
+    pub domain: String,
+    /// Extracted second-level `topic`.
+    pub topic: String,
+    /// Expected target wiki summary path (`"wiki/sources/<scoped_path>"`).
+    pub expected_wiki_path: String,
+    /// Character count of `raw_body`.
+    pub body_char_count: usize,
+    /// Line count of `raw_body`.
+    pub body_line_count: usize,
+    /// Pre-formatted compact tool output string ready to return to a `source_collector` agent.
+    pub agent_output: String,
+}
+
+/// Render the full Markdown content for a `WriteTopicSourceRequest`.
+pub fn render_topic_source_markdown(
+    req: &WriteTopicSourceRequest,
+) -> (String, String, String, String, usize, usize) {
+    let topic_folder = sanitize_topic_folder(&req.topic_folder);
+    let mut parts = topic_folder.split('/');
+    let domain = parts.next().unwrap_or("general").to_string();
+    let topic = parts.next().unwrap_or(&domain).to_string();
+
+    let mut tags = vec![
+        "wiki/source".to_string(),
+        format!("topic/{topic_folder}"),
+    ];
+    for item in &req.tags {
+        let clean = item.trim().trim_start_matches('#').to_string();
+        if !clean.is_empty() && !tags.contains(&clean) {
+            tags.push(clean);
+        }
+    }
+
+    let yaml_tags = tags
+        .iter()
+        .map(|t| format!("  - \"{t}\""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let qmd_yaml_tags = tags
+        .iter()
+        .map(|t| format!("      - \"{t}\""))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut extra_top_yaml = String::new();
+    let mut extra_qmd_yaml = String::new();
+    for (k, v) in &req.extra_frontmatter {
+        match v {
+            serde_json::Value::String(s) => {
+                let esc = s.replace('"', "\\\"");
+                extra_top_yaml.push_str(&format!("{k}: \"{esc}\"\n"));
+                extra_qmd_yaml.push_str(&format!("    {k}: \"{esc}\"\n"));
+            }
+            serde_json::Value::Number(n) => {
+                extra_top_yaml.push_str(&format!("{k}: {n}\n"));
+                extra_qmd_yaml.push_str(&format!("    {k}: {n}\n"));
+            }
+            serde_json::Value::Bool(b) => {
+                extra_top_yaml.push_str(&format!("{k}: {b}\n"));
+                extra_qmd_yaml.push_str(&format!("    {k}: {b}\n"));
+            }
+            _ => {}
+        }
+    }
+
+    let char_count = req.raw_body.chars().count();
+    let line_count = req.raw_body.lines().count().max(1);
+    let escaped_title = req.title.replace('"', "\\\"");
+    let heading = req.body_heading.as_deref().unwrap_or("Raw Transcript");
+
+    let mut bullets = format!("- **Chủ đề (Topic Folder):** `{topic_folder}`\n");
+    for (label, val) in &req.header_bullets {
+        bullets.push_str(&format!("- **{label}:** {val}\n"));
+    }
+    bullets.push_str(&format!(
+        "- **Độ dài Nội dung:** {char_count} ký tự ({line_count} dòng)\n"
+    ));
+
+    let md = format!(
+        "---\ntitle: \"{escaped_title}\"\ncategory: \"raw_source\"\ndomain: \"{domain}\"\ntopic: \"{topic}\"\n{extra_top_yaml}tags:\n{yaml_tags}\nqmd:\n  metadata:\n    category: \"raw_source\"\n    domain: \"{domain}\"\n    topic: \"{topic}\"\n{extra_qmd_yaml}    tags:\n{qmd_yaml_tags}\n---\n\n# {}\n\n{bullets}\n## {heading}\n\n{}\n",
+        req.title, req.raw_body
+    );
+
+    let stem = req
+        .file_stem
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| slugify(&req.title, 36));
+    let scoped_path = format!("{topic_folder}/{}.md", stem.trim_end_matches(".md"));
+
+    (md, scoped_path, topic_folder, domain, char_count, line_count)
 }

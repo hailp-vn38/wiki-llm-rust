@@ -459,14 +459,14 @@ Preliminary notes on BM25 search and vector ranking.
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Requirement #5: Full suite of 12 LLM Tools (`llm_tool_definitions` + `execute_llm_tool`).
+/// Requirement #5: Full suite of 15 LLM Tools (`llm_tool_definitions` + `execute_llm_tool`).
 #[test]
 fn test_req5_llm_tools_end_to_end() {
     let root = create_temp_vault("req5_llm_tools");
     let engine = WikiEngine::open(&root).unwrap();
 
     let tools = engine.llm_tool_definitions();
-    assert_eq!(tools.len(), 14);
+    assert_eq!(tools.len(), 15);
 
     // 1. Call `wiki_write_file` to create a nested raw source `docs/flow/lib.md`
     let write_src_res = engine
@@ -881,6 +881,104 @@ fn test_incremental_source_updates_existing_wiki_without_creating_new_file() {
     assert!(lint2.broken_links.is_empty());
     // And the `[!WARNING] Contradiction:` line is surfaced in `flagged_contradictions_or_gaps`!
     assert_eq!(lint2.flagged_contradictions_or_gaps.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Test reusable flow utilities added to `llm-wiki`:
+/// `apply_template`, `write_topic_source`, `execute_llm_tool_with_budget`, `wiki_delete_file`,
+/// `build_next_autoflow_prompt`, `AdaptiveReadBudget`, `sanitize_mermaid_fences`, and `is_read_only_wiki_tool`.
+#[test]
+fn test_flow_utilities_and_adaptive_tool_executor() {
+    let root = create_temp_vault("flow_utilities");
+    let engine = WikiEngine::open(&root).unwrap();
+
+    // 1. Apply domain template and verify 5 QMD path contexts + SCHEMA.md
+    let tpl = engine
+        .apply_template(llm_wiki::WikiTemplateId::Research)
+        .unwrap();
+    assert!(!tpl.schema_md.is_empty());
+    assert_eq!(engine.list_path_contexts().unwrap().len(), 5);
+
+    // 2. When vault has 0 sources, `build_next_autoflow_prompt` returns `initial_collection_prompt`
+    let step0 = engine
+        .build_next_autoflow_prompt(Some("Collect playlist sources"))
+        .unwrap();
+    assert_eq!(step0.as_deref(), Some("Collect playlist sources"));
+
+    // 3. Write a topic source via `write_topic_source`
+    let written = engine
+        .write_topic_source(llm_wiki::WriteTopicSourceRequest {
+            topic_folder: "sources/Trading / Smart Money Concepts".to_string(),
+            file_stem: Some("01-pd-arrays".to_string()),
+            title: "PD Arrays & Order Flow".to_string(),
+            raw_body: "Line 1 of transcript.\nLine 2 of transcript.".to_string(),
+            body_heading: Some("Raw Transcript".to_string()),
+            tags: vec!["ict".to_string(), "smc".to_string()],
+            extra_frontmatter: vec![("video_id".to_string(), json!("abc123"))],
+            header_bullets: vec![("Video ID".to_string(), "`abc123`".to_string())],
+            preview_chars: Some(200),
+        })
+        .unwrap();
+    assert_eq!(written.topic_folder, "trading/smart-money-concepts");
+    assert_eq!(
+        written.info.rel_path,
+        "sources/trading/smart-money-concepts/01-pd-arrays.md"
+    );
+    assert!(written
+        .agent_output
+        .contains("RAW_SOURCE_SAVED: sources/trading/smart-money-concepts/01-pd-arrays.md"));
+
+    // 4. Now `build_next_autoflow_prompt` detects the uningested source
+    let step1 = engine
+        .build_next_autoflow_prompt(Some("Collect playlist sources"))
+        .unwrap()
+        .unwrap();
+    assert!(step1.contains("[AUTO-FLOW: NEW SOURCES DETECTED]"));
+    assert!(step1.contains("trading/smart-money-concepts/01-pd-arrays.md"));
+
+    // 5. Execute `wiki_get` on `sources/...` via `execute_llm_tool_with_budget` -> frontmatter stripped & budgeted
+    let budget = llm_wiki::AdaptiveReadBudget::for_context_limit(200_000);
+    assert_eq!(budget.default_lines, 400);
+    assert!(llm_wiki::is_read_only_wiki_tool("wiki_get"));
+    assert!(!llm_wiki::is_read_only_wiki_tool("wiki_delete_file"));
+
+    let get_out = engine
+        .execute_llm_tool_with_budget(
+            "wiki_get",
+            json!({ "file": "sources/trading/smart-money-concepts/01-pd-arrays.md" }),
+            budget,
+        )
+        .unwrap();
+    assert!(!get_out.content.contains("qmd:\n  metadata:"));
+    assert!(get_out.content.contains("# PD Arrays & Order Flow"));
+
+    // 6. Execute `wiki_write_file` with malformed `</mermaid>` fence -> automatically sanitized to ```
+    engine
+        .execute_llm_tool_with_budget(
+            "wiki_write_file",
+            json!({
+                "scope": "wiki",
+                "rel_path": "concepts/temp-dup.md",
+                "content": "---\ntitle: \"Temp\"\ncategory: \"concept\"\n---\n\n# Temp\n```mermaid\nflowchart LR\n  A[\"One\"] --> B[\"Two\"]\n</mermaid>\n"
+            }),
+            budget,
+        )
+        .unwrap();
+    let saved_temp = std::fs::read_to_string(root.join("wiki/concepts/temp-dup.md")).unwrap();
+    assert!(!saved_temp.contains("</mermaid>"));
+    assert!(saved_temp.contains("```\n"));
+
+    // 7. Execute `wiki_delete_file` to remove the duplicate/temp page
+    let del_out = engine
+        .execute_llm_tool_with_budget(
+            "wiki_delete_file",
+            json!({ "rel_path": "concepts/temp-dup.md" }),
+            budget,
+        )
+        .unwrap();
+    assert!(del_out.content.contains("deleted=true"));
+    assert!(!root.join("wiki/concepts/temp-dup.md").exists());
 
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -138,65 +138,27 @@ fn print_event(data: &Value, secret: &str) {
     }
 }
 
-/// Kiểm tra trạng thái thực tế của Vault trên đĩa để tạo prompt chính xác cho phần việc còn lại
-/// mà không cần phụ thuộc vào lịch sử hội thoại dài của session cũ.
+/// Kiểm tra trạng thái thực tế của Vault trên đĩa qua `WikiEngine::build_next_autoflow_prompt`
+/// để tạo prompt chính xác cho phần việc còn lại mà không cần phụ thuộc vào lịch sử hội thoại dài của session cũ.
 fn build_next_autoflow_prompt(env: &SharedEnv, playlist_url: &str) -> Result<Option<String>> {
-    let _ = env.engine.rebuild_or_sync_index_md();
-    let status = env.engine.status()?;
-    if status.sources_count == 0 {
-        return Ok(Some(format!(
-            "Hãy lấy thông tin chi tiết trong playlist và lưu vào source theo chủ đề.\nPlaylist URL: {playlist_url}"
-        )));
-    }
-
-    let lint = env.engine.lint_wiki()?;
-    let compact_index = env
+    let initial_prompt = format!(
+        "Hãy lấy thông tin chi tiết trong playlist và lưu vào source theo chủ đề.\nPlaylist URL: {playlist_url}"
+    );
+    let next = env
         .engine
-        .read_compact_index_md(2_500)
-        .unwrap_or_default();
-
-    if !lint.uningested_sources.is_empty() {
-        let new_sources_list = lint
-            .uningested_sources
-            .iter()
-            .map(|s| format!("- `{}`", s.source_rel_path.trim_start_matches("sources/")))
-            .collect::<Vec<_>>()
-            .join("\n");
-        println!(
-            "\n[Auto-Flow Watcher] Phát hiện {} tài liệu trong `sources/` chưa được Ingest vào `wiki/` -> Điều phối subagent `wiki_ingestor`...",
-            lint.uningested_sources.len()
-        );
-        return Ok(Some(format!(
-            "[AUTO-FLOW: NEW SOURCES DETECTED]\n\
-             Hệ thống phát hiện {} tài liệu mới trong `sources/` chưa được ingest vào `wiki/`:\n{}\n\n\
-             === CURRENT COMPACT WIKI INDEX ===\n{}\n\
-             ==================================\n\n\
-             Hãy điều phối subagent `wiki_ingestor` (gọi tuần tự từng file một) để ingest toàn bộ các file mới này vào `wiki/`, sau đó gọi `wiki_curator` để tổng hợp Synthesis và chạy `wiki_lint`.",
-            lint.uningested_sources.len(),
-            new_sources_list,
-            compact_index.trim()
-        )));
+        .build_next_autoflow_prompt(Some(&initial_prompt))?;
+    if let Some(ref p) = next {
+        if p.starts_with("[AUTO-FLOW: NEW SOURCES DETECTED]") {
+            println!(
+                "\n[Auto-Flow Watcher] Phát hiện tài liệu mới trong `sources/` chưa được Ingest vào `wiki/` -> Điều phối subagent `wiki_ingestor`..."
+            );
+        } else if p.starts_with("[AUTO-FLOW: WIKI LINT]") {
+            println!(
+                "\n[Auto-Flow Watcher] Phát hiện vấn đề cần hoàn thiện trong Wiki -> Điều phối subagent `wiki_curator`..."
+            );
+        }
     }
-
-    if !lint.is_healthy {
-        println!(
-            "\n[Auto-Flow Watcher] Phát hiện vấn đề cần hoàn thiện trong Wiki (broken_links={}, orphan_wiki_pages={}) -> Điều phối subagent `wiki_curator`...",
-            lint.broken_links.len(),
-            lint.orphan_wiki_pages.len()
-        );
-        return Ok(Some(format!(
-            "[AUTO-FLOW: WIKI LINT]\n\
-             `wiki_lint` phát hiện `broken_links={:?}` và `orphan_wiki_pages={:?}`.\n\n\
-             === CURRENT COMPACT WIKI INDEX ===\n{}\n\
-             ==================================\n\n\
-             Hãy điều phối subagent `wiki_curator` để sửa toàn bộ liên kết gãy/trang mồ côi và đảm bảo `is_healthy: true`.",
-            lint.broken_links,
-            lint.orphan_wiki_pages,
-            compact_index.trim()
-        )));
-    }
-
-    Ok(None)
+    Ok(next)
 }
 
 pub(crate) async fn run_orchestrator_turn(

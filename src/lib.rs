@@ -23,15 +23,17 @@ pub use prompts::{
     is_safe_ingest_wiki_path, parse_file_blocks, parse_review_blocks, parse_semantic_lint_blocks,
     IngestPromptContext, OutputLanguage, ParseFileBlocksResult, ParsedFileBlock,
     ParsedReviewBlock, ParsedSemanticLintBlock, ReviewBlockType, SemanticLintIssueType,
-    WikiRetrievalMode, WikiTemplate, WikiTemplateId, WikilinkSubstitution,
+    WikiRetrievalMode, WikiTemplate, WikiTemplateId, WikilinkSubstitution, ROOT_DISPATCHER_PROMPT,
+    SOURCE_COLLECTOR_PROMPT, WIKI_CURATOR_PROMPT, WIKI_INGESTOR_PROMPT,
 };
 pub use db::filter_sql::{
     ComparisonOperator, LogicalOperator, MetadataCondition, MetadataFilter, NotOperator,
 };
 pub use error::{WikiError, WikiResult};
 pub use fs::file_ops::{
-    slice_and_format_lines, slice_lines_with_budget, DEFAULT_READ_MAX_CHARS,
-    DEFAULT_READ_WINDOW_LINES,
+    clip_transcript, fold_vietnamese, sanitize_mermaid_fences, sanitize_topic_folder,
+    slice_and_format_lines, slice_lines_with_budget, slugify, vtt_to_text, AdaptiveReadBudget,
+    DEFAULT_READ_MAX_CHARS, DEFAULT_READ_WINDOW_LINES,
 };
 pub use fs::tree::{FileTreeNode, NodeType, TreeDocMeta, TreeOptions, TreeScope};
 pub use graph::analysis::{GraphData, GraphEdge, GraphNode};
@@ -49,13 +51,15 @@ pub use search::{
     ExpandedQuery, HybridQueryRequest, RrfContribution, RrfExplainTrace, SearchExplainTrace,
     SearchOptions, SearchResultItem, SubQuery, SubQueryType,
 };
-pub use tools::definitions::LlmToolSpec;
+pub use tools::definitions::{is_read_only_wiki_tool, LlmToolSpec};
+pub use tools::executor::{execute_tool_call_with_budget, LlmToolOutcome};
 pub use types::{
     CollectionScope, DocumentInfo, DocumentResult, EmbedStats, EngineStatus, GetOptions,
     MultiGetError, MultiGetOptions, MultiGetResult, PathContextItem, SyncStats,
 };
 pub use wiki::ingest::{
-    map_source_to_wiki_scoped_path, FileSynthesisRequest, IngestSourceRequest, IngestSourceResponse,
+    map_source_to_wiki_scoped_path, render_topic_source_markdown, FileSynthesisRequest,
+    IngestSourceRequest, IngestSourceResponse, WriteTopicSourceRequest, WriteTopicSourceResponse,
 };
 pub use wiki::linter::{
     BrokenLinkItem, FlaggedClaimItem, StaleWikiPageItem, UningestedSourceItem, UnlinkedMentionItem,
@@ -201,6 +205,40 @@ impl WikiEngine {
         &self.config
     }
 
+    /// Apply a built-in domain `WikiTemplateId` (`Research`, `Personal`, `Team`, `Course`, `Book`)
+    /// by writing its `SCHEMA.md` and registering the 5 standard QMD path contexts
+    /// (`sources:/`, `wiki:/sources`, `wiki:/entities`, `wiki:/concepts`, `wiki:/syntheses`).
+    pub fn apply_template(&self, template_id: WikiTemplateId) -> WikiResult<WikiTemplate> {
+        let template = get_wiki_template(template_id);
+        self.set_schema_md(&template.schema_md)?;
+        self.set_path_context(
+            Some(CollectionScope::Sources),
+            "/",
+            "Raw immutable source documents organized by topic folder (<domain>/<topic>)",
+        )?;
+        self.set_path_context(
+            Some(CollectionScope::Wiki),
+            "/sources",
+            "Compiled source summary wiki pages preserving raw source filenames and topic folders",
+        )?;
+        self.set_path_context(
+            Some(CollectionScope::Wiki),
+            "/entities",
+            "Canonical entity pages (people, platforms, languages, tools, datasets)",
+        )?;
+        self.set_path_context(
+            Some(CollectionScope::Wiki),
+            "/concepts",
+            "Canonical concept pages (strategies, algorithms, architectural patterns, methods)",
+        )?;
+        self.set_path_context(
+            Some(CollectionScope::Wiki),
+            "/syntheses",
+            "Cross-source comparative syntheses, tables, and knowledge maps",
+        )?;
+        Ok(template)
+    }
+
     // =========================================================================
     // 2. FILE & NESTED FOLDER CRUD + TREE API (Requirements #3, #6, #7)
     // =========================================================================
@@ -211,6 +249,51 @@ impl WikiEngine {
     /// automatically creates `sources/docs/` and `sources/docs/flow/`, writes `lib.md`, and indexes it.
     pub fn write_source_file(&self, rel_path: &str, content: &str) -> WikiResult<DocumentInfo> {
         self.write_file(CollectionScope::Sources, rel_path, content)
+    }
+
+    /// Write a standardized Raw Source Markdown file organized by `<domain>/<topic>` folder
+    /// into `sources/<topic_folder>/<file_stem>.md` with YAML frontmatter + `qmd.metadata`,
+    /// returning both the indexed `DocumentInfo` and a compact agent preview (`WriteTopicSourceResponse`).
+    pub fn write_topic_source(
+        &self,
+        req: WriteTopicSourceRequest,
+    ) -> WikiResult<WriteTopicSourceResponse> {
+        let (raw_md, scoped_path, topic_folder, domain, body_char_count, body_line_count) =
+            render_topic_source_markdown(&req);
+        let topic = topic_folder
+            .split('/')
+            .nth(1)
+            .unwrap_or(&domain)
+            .to_string();
+        let info = self.write_source_file(&scoped_path, &raw_md)?;
+        let expected_wiki_path = format!(
+            "{}/sources/{}",
+            self.config.wiki_dir_name, info.scoped_path
+        );
+        let preview_limit = req.preview_chars.filter(|&n| n > 0).unwrap_or(600);
+        let short_preview = clip_transcript(&req.raw_body, preview_limit);
+        let agent_output = format!(
+            "RAW_SOURCE_SAVED: {}\nSOURCE_SCOPED_PATH: {}\nEXPECTED_WIKI_PATH: {}\nTOPIC_FOLDER: {}\nDOCID: {}\nTITLE: {}\nCONTENT_LENGTH_CHARS: {}\nCONTENT_LINES: {}\n\n=== BEGIN SHORT PREVIEW ===\n{}\n=== END SHORT PREVIEW ===",
+            info.rel_path,
+            info.scoped_path,
+            expected_wiki_path,
+            topic_folder,
+            info.docid,
+            req.title,
+            body_char_count,
+            info.line_count,
+            short_preview
+        );
+        Ok(WriteTopicSourceResponse {
+            info,
+            topic_folder,
+            domain,
+            topic,
+            expected_wiki_path,
+            body_char_count,
+            body_line_count,
+            agent_output,
+        })
     }
 
     /// Create or overwrite a Markdown file inside `wiki/`.
@@ -239,7 +322,9 @@ impl WikiEngine {
         let prefix = format!("{}/", scope.as_str());
         let clean_scoped_input = md_rel_path.strip_prefix(&prefix).unwrap_or(&md_rel_path);
 
-        let (clean_scoped, full_path) = write_nested_file(&base_dir, clean_scoped_input, content)?;
+        let sanitized = sanitize_mermaid_fences(content);
+        let (clean_scoped, full_path) =
+            write_nested_file(&base_dir, clean_scoped_input, &sanitized)?;
 
         let conn = self.db.lock().unwrap();
         let (info, _) =
@@ -798,10 +883,10 @@ impl WikiEngine {
     }
 
     // =========================================================================
-    // 6. LLM TOOL CALLING API (Requirement #5)
+    // 6. LLM TOOL CALLING & REACTIVE AUTO-FLOW API (Requirement #5)
     // =========================================================================
 
-    /// Return JSON Schema tool definitions for all 12 built-in LLM tools.
+    /// Return JSON Schema tool definitions for all 13 built-in LLM tools.
     pub fn llm_tool_definitions(&self) -> Vec<LlmToolSpec> {
         build_llm_tool_definitions()
     }
@@ -813,5 +898,72 @@ impl WikiEngine {
         arguments: serde_json::Value,
     ) -> WikiResult<serde_json::Value> {
         execute_tool_call(self, tool_name, arguments)
+    }
+
+    /// Execute a named LLM tool with an `AdaptiveReadBudget` and return a compact `LlmToolOutcome`
+    /// ready to plug into any LLM agent/subagent tool loop.
+    pub fn execute_llm_tool_with_budget(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        read_budget: AdaptiveReadBudget,
+    ) -> WikiResult<LlmToolOutcome> {
+        execute_tool_call_with_budget(self, tool_name, arguments, read_budget)
+    }
+
+    /// Inspect the live state of `sources/` and `wiki/` on disk to compute the next reactive
+    /// Auto-Flow dispatcher prompt without relying on prior session conversation history:
+    /// - If `sources/` is empty, returns `initial_collection_prompt`.
+    /// - If `uningested_sources` exist in `sources/`, returns an `[AUTO-FLOW: NEW SOURCES DETECTED]`
+    ///   prompt listing the uningested paths alongside the compact `wiki/index.md`.
+    /// - If `wiki_lint` reports `broken_links` or `orphan_wiki_pages`, returns an `[AUTO-FLOW: WIKI LINT]`
+    ///   prompt for `wiki_curator`.
+    /// - If the vault is fully ingested and healthy (`is_healthy: true`), returns `Ok(None)`.
+    pub fn build_next_autoflow_prompt(
+        &self,
+        initial_collection_prompt: Option<&str>,
+    ) -> WikiResult<Option<String>> {
+        let _ = self.rebuild_or_sync_index_md();
+        let status = self.status()?;
+        if status.sources_count == 0 {
+            return Ok(initial_collection_prompt.map(ToString::to_string));
+        }
+
+        let lint = self.lint_wiki()?;
+        let compact_index = self.read_compact_index_md(2_500).unwrap_or_default();
+
+        if !lint.uningested_sources.is_empty() {
+            let new_sources_list = lint
+                .uningested_sources
+                .iter()
+                .map(|s| format!("- `{}`", s.source_rel_path.trim_start_matches("sources/")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Ok(Some(format!(
+                "[AUTO-FLOW: NEW SOURCES DETECTED]\n\
+                 Hệ thống phát hiện {} tài liệu mới trong `sources/` chưa được ingest vào `wiki/`:\n{}\n\n\
+                 === CURRENT COMPACT WIKI INDEX ===\n{}\n\
+                 ==================================\n\n\
+                 Hãy điều phối subagent `wiki_ingestor` (gọi tuần tự từng file một) để ingest toàn bộ các file mới này vào `wiki/`, sau đó gọi `wiki_curator` để tổng hợp Synthesis và chạy `wiki_lint`.",
+                lint.uningested_sources.len(),
+                new_sources_list,
+                compact_index.trim()
+            )));
+        }
+
+        if !lint.is_healthy {
+            return Ok(Some(format!(
+                "[AUTO-FLOW: WIKI LINT]\n\
+                 `wiki_lint` phát hiện `broken_links={:?}` và `orphan_wiki_pages={:?}`.\n\n\
+                 === CURRENT COMPACT WIKI INDEX ===\n{}\n\
+                 ==================================\n\n\
+                 Hãy điều phối subagent `wiki_curator` để sửa toàn bộ liên kết gãy/trang mồ côi và đảm bảo `is_healthy: true`.",
+                lint.broken_links,
+                lint.orphan_wiki_pages,
+                compact_index.trim()
+            )));
+        }
+
+        Ok(None)
     }
 }

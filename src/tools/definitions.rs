@@ -9,7 +9,21 @@ pub struct LlmToolSpec {
     pub parameters: Value,
 }
 
-/// Return the complete list of 12 LLM tools for operating on the QMD + Obsidian LLM Wiki.
+/// Return `true` if the named built-in Wiki tool only reads state without mutating files or database records.
+pub fn is_read_only_wiki_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "wiki_tree"
+            | "wiki_query"
+            | "wiki_get"
+            | "wiki_multi_get"
+            | "wiki_metadata"
+            | "wiki_status"
+            | "wiki_graph_neighbors"
+    )
+}
+
+/// Return the complete list of built-in LLM tools for operating on the QMD + Obsidian LLM Wiki.
 pub fn build_llm_tool_definitions() -> Vec<LlmToolSpec> {
     vec![
         LlmToolSpec {
@@ -387,6 +401,26 @@ pub fn build_llm_tool_definitions() -> Vec<LlmToolSpec> {
                     "content": {
                         "type": "string",
                         "description": "New content for `SCHEMA.md` when mode='write'."
+                    }
+                }
+            }),
+        },
+        LlmToolSpec {
+            name: "wiki_delete_file".to_string(),
+            description: "Delete a duplicate or obsolete Markdown page inside `wiki` or `sources`, automatically pruning empty folders and refreshing `wiki/index.md` + Obsidian Graph links.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "required": ["rel_path"],
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "enum": ["wiki", "sources"],
+                        "default": "wiki",
+                        "description": "Target collection folder ('wiki' or 'sources'). Defaults to 'wiki'."
+                    },
+                    "rel_path": {
+                        "type": "string",
+                        "description": "Relative path inside the collection to delete (e.g. 'entities/duplicate.md' or 'concepts/old.md')."
                     }
                 }
             }),
