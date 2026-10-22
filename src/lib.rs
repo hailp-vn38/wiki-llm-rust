@@ -378,6 +378,21 @@ impl WikiEngine {
         Ok(deleted_disk || deleted_db)
     }
 
+    /// Delete a Markdown page inside `wiki/`, pruning empty parent folders, removing it from SQLite & Graph,
+    /// and syncing `wiki/index.md`.
+    pub fn delete_wiki_file(&self, rel_path: &str) -> WikiResult<bool> {
+        let deleted = self.delete_file(CollectionScope::Wiki, rel_path)?;
+        if deleted {
+            let _ = self.rebuild_or_sync_index_md();
+        }
+        Ok(deleted)
+    }
+
+    /// Delete a raw source Markdown file inside `sources/`, pruning empty parent folders and removing it from SQLite.
+    pub fn delete_source_file(&self, rel_path: &str) -> WikiResult<bool> {
+        self.delete_file(CollectionScope::Sources, rel_path)
+    }
+
     /// Move or rename a file within `sources` or `wiki`, automatically creating nested target directories
     /// and re-indexing links.
     pub fn move_file(
