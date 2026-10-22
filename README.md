@@ -4,7 +4,7 @@
 
 A local-first Rust library combining Andrej Karpathy's **[LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)** compounding knowledge architecture with **[QMD (Query Markup Documents)](https://github.com/tobi/qmd)** hybrid Markdown search and 100% **[Obsidian Graph View](https://obsidian.md)** compatibility.
 
-- **Crate**: [`llm-wiki-rs`](https://crates.io/crates/llm-wiki-rs) `v0.1.1` (imported in Rust as `llm_wiki`), edition 2021
+- **Crate**: [`llm-wiki-rs`](https://crates.io/crates/llm-wiki-rs) `v0.1.2` (imported in Rust as `llm_wiki`), edition 2021
 - **Storage**: Embedded SQLite (`rusqlite` bundled + FTS5 BM25 + vector cosine distance + graph edge index) stored directly inside `<data_root>/.wiki/index.sqlite`
 - **Detailed Architecture**: [ARCHITECTURE.md](./ARCHITECTURE.md) · [docs/karpathy-llm-wiki.md](./docs/karpathy-llm-wiki.md)
 
@@ -28,7 +28,7 @@ Add `llm-wiki-rs` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-llm-wiki-rs = "0.1.1"
+llm-wiki-rs = "0.1.2"
 ```
 
 > Note: The library target name is `llm_wiki`, so you import it in Rust code with `use llm_wiki::*;`.
