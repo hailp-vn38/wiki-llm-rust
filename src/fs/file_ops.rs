@@ -295,10 +295,13 @@ pub fn sanitize_topic_folder(raw: &str) -> String {
 /// 2. Unwrap single backticks around Obsidian WikiLinks (`` `[[target]]` `` -> `[[target]]` and
 ///    `` `![[target]]` `` -> `![[target]]`) outside of fenced code blocks so Obsidian renders them
 ///    as live clickable links and Graph View edges instead of dead inline code pills.
+/// 3. Normalize standard Markdown links pointing to image or video URLs (`[label](media_url)`)
+///    into embedded media syntax (`![label](media_url)`) outside of fenced/inline code blocks.
 pub fn sanitize_mermaid_fences(md: &str) -> String {
     let needs_mermaid_fix = md.contains("</mermaid>") || md.contains("</MERMAID>");
     let needs_wikilink_unquote = md.contains("`[[") || md.contains("`![[");
-    if !needs_mermaid_fix && !needs_wikilink_unquote {
+    let needs_media_link_fix = md.contains("](");
+    if !needs_mermaid_fix && !needs_wikilink_unquote && !needs_media_link_fix {
         return md.to_string();
     }
 
@@ -332,8 +335,16 @@ pub fn sanitize_mermaid_fences(md: &str) -> String {
             continue;
         }
 
-        if !in_code_fence && (line.contains("`[[") || line.contains("`![[")) {
-            out_lines.push(unwrap_backticked_wikilinks_on_line(line));
+        if !in_code_fence {
+            let mut processed = if line.contains("`[[") || line.contains("`![[") {
+                unwrap_backticked_wikilinks_on_line(line)
+            } else {
+                line.to_string()
+            };
+            if processed.contains("](") {
+                processed = normalize_media_markdown_links_on_line(&processed);
+            }
+            out_lines.push(processed);
         } else {
             out_lines.push(line.to_string());
         }
@@ -343,6 +354,233 @@ pub fn sanitize_mermaid_fences(md: &str) -> String {
     if md.ends_with('\n') && !out.ends_with('\n') {
         out.push('\n');
     }
+    out
+}
+
+/// Check whether a Markdown link target URL points to an image or video resource
+/// (direct image/video file extensions or video streaming links such as YouTube, Vimeo, Dailymotion, Loom).
+pub fn is_media_url(raw_target: &str) -> bool {
+    let trimmed = raw_target.trim().trim_start_matches('<').trim_end_matches('>');
+    let url_part = trimmed.split_whitespace().next().unwrap_or("").trim_end_matches('>');
+    if url_part.is_empty() {
+        return false;
+    }
+
+    let lower = url_part.to_ascii_lowercase();
+    let without_fragment = lower.split('#').next().unwrap_or(&lower);
+    let path_part = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+
+    const MEDIA_EXTENSIONS: [&str; 20] = [
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif", ".bmp", ".ico", ".tiff",
+        ".tif", ".mp4", ".webm", ".mov", ".m4v", ".ogv", ".ogg", ".mkv", ".avi", ".m3u8",
+    ];
+    if MEDIA_EXTENSIONS.iter().any(|ext| path_part.ends_with(ext)) {
+        return true;
+    }
+
+    // Check YouTube video URLs
+    if (lower.contains("youtube.com/watch")
+        || lower.contains("m.youtube.com/watch")
+        || lower.contains("music.youtube.com/watch"))
+        && (lower.contains("?v=") || lower.contains("&v="))
+    {
+        return true;
+    }
+    for prefix in [
+        "https://youtu.be/",
+        "http://youtu.be/",
+        "https://www.youtu.be/",
+        "https://youtube.com/shorts/",
+        "https://www.youtube.com/shorts/",
+        "https://m.youtube.com/shorts/",
+        "https://youtube.com/embed/",
+        "https://www.youtube.com/embed/",
+        "https://www.youtube-nocookie.com/embed/",
+        "https://youtube.com/live/",
+        "https://www.youtube.com/live/",
+        "https://player.vimeo.com/video/",
+        "https://www.dailymotion.com/video/",
+        "https://dailymotion.com/video/",
+        "https://dai.ly/",
+        "https://www.loom.com/share/",
+        "https://loom.com/share/",
+        "https://www.loom.com/embed/",
+        "https://loom.com/embed/",
+    ] {
+        if let Some(rest) = without_fragment.strip_prefix(prefix) {
+            let slug = rest.split(['?', '/', '&']).next().unwrap_or("");
+            if !slug.is_empty() {
+                return true;
+            }
+        }
+    }
+
+    for vimeo_prefix in ["https://vimeo.com/", "http://vimeo.com/", "https://www.vimeo.com/"] {
+        if let Some(rest) = without_fragment.strip_prefix(vimeo_prefix) {
+            let slug = rest.split(['?', '/', '&']).next().unwrap_or("");
+            if !slug.is_empty() && slug.chars().all(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Convert standard Markdown links `[label](url)` pointing to image or video URLs into
+/// embedded Markdown syntax `![label](url)` outside of fenced code blocks and inline code spans.
+pub fn normalize_media_markdown_links(md: &str) -> String {
+    if !md.contains("](") {
+        return md.to_string();
+    }
+    let mut in_code_fence = false;
+    let mut fence_marker = "";
+    let mut out_lines = Vec::new();
+
+    for line in md.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            let marker = if trimmed.starts_with("```") {
+                "```"
+            } else {
+                "~~~"
+            };
+            if !in_code_fence {
+                in_code_fence = true;
+                fence_marker = marker;
+            } else if trimmed.starts_with(fence_marker) {
+                in_code_fence = false;
+                fence_marker = "";
+            }
+            out_lines.push(line.to_string());
+            continue;
+        }
+
+        if !in_code_fence && line.contains("](") {
+            out_lines.push(normalize_media_markdown_links_on_line(line));
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+
+    let mut out = out_lines.join("\n");
+    if md.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+fn normalize_media_markdown_links_on_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len() + 8);
+    let mut rest = line;
+
+    while let Some(tick_idx) = rest.find('`') {
+        out.push_str(&normalize_media_links_in_plain_segment(&rest[..tick_idx]));
+        let after_open = &rest[tick_idx..];
+        let tick_count = after_open.chars().take_while(|&c| c == '`').count();
+        let fence: String = std::iter::repeat('`').take(tick_count).collect();
+        let after_ticks = &after_open[tick_count..];
+        if let Some(close_rel) = after_ticks.find(&fence) {
+            let span_len = tick_count + close_rel + tick_count;
+            out.push_str(&after_open[..span_len]);
+            rest = &after_open[span_len..];
+        } else {
+            out.push_str(after_open);
+            rest = "";
+            break;
+        }
+    }
+
+    if !rest.is_empty() {
+        out.push_str(&normalize_media_links_in_plain_segment(rest));
+    }
+    out
+}
+
+fn normalize_media_links_in_plain_segment(seg: &str) -> String {
+    if !seg.contains("](") {
+        return seg.to_string();
+    }
+    let mut out = String::with_capacity(seg.len() + 8);
+    let mut cursor = 0;
+    let bytes = seg.as_bytes();
+
+    while cursor < seg.len() {
+        let Some(rel_open) = seg[cursor..].find('[') else {
+            out.push_str(&seg[cursor..]);
+            break;
+        };
+        let open_idx = cursor + rel_open;
+        out.push_str(&seg[cursor..open_idx]);
+
+        let prev_char = if open_idx > 0 {
+            seg[..open_idx].chars().next_back()
+        } else {
+            out.chars().next_back()
+        };
+
+        // Skip Obsidian WikiLinks `[[...]]`
+        if bytes.get(open_idx + 1) == Some(&b'[') {
+            out.push_str("[[");
+            cursor = open_idx + 2;
+            continue;
+        }
+
+        // Find matching `]` without crossing another `[`
+        let after_open = &seg[open_idx + 1..];
+        let Some(rel_close_bracket) = after_open.find(']') else {
+            out.push_str(&seg[open_idx..]);
+            break;
+        };
+        let label = &after_open[..rel_close_bracket];
+        if label.contains('[') {
+            // Nested bracket (e.g. `[![img](...)](...)`): advance past `[` and keep scanning
+            out.push('[');
+            cursor = open_idx + 1;
+            continue;
+        }
+
+        let close_bracket_idx = open_idx + 1 + rel_close_bracket;
+        if bytes.get(close_bracket_idx + 1) != Some(&b'(') {
+            out.push_str(&seg[open_idx..=close_bracket_idx]);
+            cursor = close_bracket_idx + 1;
+            continue;
+        }
+
+        // Parse `(target)` supporting balanced parentheses inside URLs
+        let target_start = close_bracket_idx + 2;
+        let mut depth = 1usize;
+        let mut close_paren_idx = None;
+        for (i, ch) in seg[target_start..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_paren_idx = Some(target_start + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(end_paren) = close_paren_idx {
+            let target = &seg[target_start..end_paren];
+            if prev_char != Some('!') && prev_char != Some('[') && is_media_url(target) {
+                out.push('!');
+            }
+            out.push_str(&seg[open_idx..=end_paren]);
+            cursor = end_paren + 1;
+        } else {
+            out.push_str(&seg[open_idx..target_start]);
+            cursor = target_start;
+        }
+    }
+
     out
 }
 
@@ -490,5 +728,32 @@ SELECT * FROM `core_deposit`;
         assert!(sanitized.contains("- **Concept**: [[concepts/early-redemption]] (bảng `core_deposit` giữ nguyên)"));
         assert!(sanitized.contains("- **Source**: [[sources/data-science/banking-analytics/doc.md]]"));
         assert!(sanitized.contains("-- Inside fenced code block, keep `[[entities/core-deposit]]` intact"));
+    }
+
+    #[test]
+    fn test_normalize_media_markdown_links_for_images_and_videos() {
+        let input = "\
+# Báo cáo tổng hợp
+
+- Video gốc: [Tóm tắt video AI](https://www.youtube.com/watch?v=uY13C-jwXFk&t=12s)
+- Video rút gọn: [Short link](https://youtu.be/tiDCkt-TwWM)
+- Ảnh minh họa: [Sơ đồ kiến trúc](https://cdn.example.com/uploads/arch.webp?width=800)
+- Đã có sẵn dấu chấm than: ![Biểu đồ](https://cdn.example.com/chart.png)
+- Link bài báo thường: [Bài báo 24h](https://www.24h.com.vn/tin-tuc-quoc-te/bai-viet-c415a1658240.html)
+- Inline code giữ nguyên: `[Ảnh code](https://cdn.example.com/code.png)`
+
+```markdown
+[Trong code fence giữ nguyên](https://www.youtube.com/watch?v=uY13C-jwXFk)
+```
+";
+        let normalized = sanitize_mermaid_fences(input);
+        assert!(normalized.contains("- Video gốc: ![Tóm tắt video AI](https://www.youtube.com/watch?v=uY13C-jwXFk&t=12s)"));
+        assert!(normalized.contains("- Video rút gọn: ![Short link](https://youtu.be/tiDCkt-TwWM)"));
+        assert!(normalized.contains("- Ảnh minh họa: ![Sơ đồ kiến trúc](https://cdn.example.com/uploads/arch.webp?width=800)"));
+        assert!(normalized.contains("- Đã có sẵn dấu chấm than: ![Biểu đồ](https://cdn.example.com/chart.png)"));
+        assert!(!normalized.contains("!![Biểu đồ]"));
+        assert!(normalized.contains("- Link bài báo thường: [Bài báo 24h](https://www.24h.com.vn/tin-tuc-quoc-te/bai-viet-c415a1658240.html)"));
+        assert!(normalized.contains("- Inline code giữ nguyên: `[Ảnh code](https://cdn.example.com/code.png)`"));
+        assert!(normalized.contains("[Trong code fence giữ nguyên](https://www.youtube.com/watch?v=uY13C-jwXFk)"));
     }
 }

@@ -31,9 +31,10 @@ pub use db::filter_sql::{
 };
 pub use error::{WikiError, WikiResult};
 pub use fs::file_ops::{
-    clip_transcript, fold_vietnamese, sanitize_mermaid_fences, sanitize_topic_folder,
-    slice_and_format_lines, slice_lines_with_budget, slugify, vtt_to_text, AdaptiveReadBudget,
-    DEFAULT_READ_MAX_CHARS, DEFAULT_READ_WINDOW_LINES,
+    clip_transcript, fold_vietnamese, is_media_url, normalize_media_markdown_links,
+    sanitize_mermaid_fences, sanitize_topic_folder, slice_and_format_lines,
+    slice_lines_with_budget, slugify, vtt_to_text, AdaptiveReadBudget, DEFAULT_READ_MAX_CHARS,
+    DEFAULT_READ_WINDOW_LINES,
 };
 pub use fs::tree::{FileTreeNode, NodeType, TreeDocMeta, TreeOptions, TreeScope};
 pub use graph::analysis::{GraphData, GraphEdge, GraphNode};

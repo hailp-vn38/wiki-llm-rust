@@ -7,9 +7,10 @@ description: "Universal 4-stage source ingestion workflow (Analysis -> Source Su
 
 Execute this disciplined 4-stage workflow whenever ingesting one or more raw source documents (`sources/<source_rel_path>`) into `wiki/`.
 
-## ⚠️ Mandatory Language & Technical Preservation Rule
+## ⚠️ Mandatory Language, Media Link & Technical Preservation Rule
 - Write all surrounding natural-language prose, explanations, and section headings in the user's requested output language (or match the primary language of the source/wiki if unspecified).
 - **Preserve proper nouns and technical identifiers in their standard original form**: organization/product/model/tool/library names, acronyms, code identifiers, SQL/API signatures, file paths, and URLs.
+- **Image & Video Links in Markdown (`![alt](url)`)**: Whenever referencing or embedding any image URL (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.svg`, etc.) or video URL (YouTube, Vimeo, `.mp4`, `.webm`, etc.) in Markdown, **ALWAYS** use embedded media syntax `![mô tả hoặc tiêu đề](url)` (with a leading `!`) instead of a standard link `[link](url)` or bare URL.
 
 ---
 

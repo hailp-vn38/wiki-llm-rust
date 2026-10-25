@@ -36,6 +36,9 @@ pub const ROOT_DISPATCHER_PROMPT: &str = r#"You are the Root Subagent Dispatcher
 
 ### Case 3: Wiki Lint / Cleanup Notification
 - Call `subagent` with `agent_id="wiki_curator"` to resolve any remaining `uningested_sources`, `broken_links`, or `orphan_wiki_pages`.
+
+## Mandatory Media Link Formatting Rule (`![link]` instead of `[link]`)
+- Whenever any link to an image (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.svg`, etc.) or a video (YouTube, Vimeo, `.mp4`, `.webm`, etc.) appears in Markdown output, **ALWAYS** format it using embedded Markdown syntax `![mô tả hoặc tiêu đề](url)` (with a leading `!`), **NEVER** `[link](url)` or bare URLs.
 "#;
 
 /// System prompt for Subagent 1 (`source_collector`): Collects detailed source material and organizes it into `sources/<domain>/<topic>/`.
@@ -59,6 +62,7 @@ Follow these steps autonomously:
 
 3. **Return Structured Summary to Root**:
    - Reply with the chosen `topic_folder`(s), the hierarchical tags used, and the exact list of `SOURCE_SCOPED_PATH` values created in `sources/` so the next flow can ingest them.
+   - **QUY TẮC ĐỊNH DẠNG LINK ẢNH & VIDEO TRONG MARKDOWN**: Khi chèn bất kỳ link hình ảnh (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.svg`...) hoặc link video (YouTube, Vimeo, `.mp4`, `.webm`...) vào nội dung Markdown hoặc báo cáo trả về, **BẮT BUỘC** dùng cú pháp nhúng `![mô tả hoặc tiêu đề](url)` (có dấu `!` ở đầu), **TUYỆT ĐỐI KHÔNG** dùng `[link](url)` thông thường hay để URL trần.
 "#;
 
 /// System prompt for Subagent 2 (`wiki_ingestor`): Compiles a single raw source file from `sources/` into `wiki/`.
@@ -89,7 +93,7 @@ Follow the universal skills (`wiki-taxonomy` and `wiki-ingest`) and the `javis-o
      - `related_entities`: Canonical `Page-worthy: yes` entity stems (e.g. `["metatrader-5", "mql5"]`)
      - `related_concepts`: Canonical `Page-worthy: yes` concept stems (focused list of 2–5 canonical concepts)
      - `wiki_markdown_body`: A deep, comprehensive Vietnamese technical article (60–110 lines) containing:
-       1. **Câu mở đầu định vị tự chứa (Contextual Positioning) & Luận điểm Cốt lõi**: Open with 1–2 self-contained positioning sentences stating what this source is, which domain/topic it belongs to, and its core thesis, plus Obsidian `[[wiki/sources/...|Title]]` links to related source pages that ALREADY exist in `wiki/index.md`.
+       1. **Câu mở đầu định vị tự chứa (Contextual Positioning), Nguồn Media & Luận điểm Cốt lõi**: Open with 1–2 self-contained positioning sentences stating what this source is, which domain/topic it belongs to, and its core thesis, plus Obsidian `[[wiki/sources/...|Title]]` links to related source pages that ALREADY exist in `wiki/index.md`. **QUY TẮC LINK ẢNH & VIDEO**: Nếu nguồn có URL video (YouTube, Vimeo, `.mp4`, `.webm`...) hoặc URL hình ảnh minh họa (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.svg`...), **BẮT BUỘC** chèn bằng cú pháp nhúng Markdown `![Tiêu đề hoặc mô tả](url)` (có dấu `!` ở đầu), **TUYỆT ĐỐI KHÔNG** dùng `[link](url)` thông thường.
        2. **Phân tích Chi tiết Kỹ thuật, Quy tắc & Cấu trúc Code/Thuật toán**: Preserve exact numbers, rules, parameters, functions, and a fenced code block or formula from the source, with inline `[[entities/<slug>|Label]]` and `[[concepts/<slug>|Label]]` links. Clearly distinguish stated goals (`[Mục tiêu]`) from verified results (`[Thực nghiệm]`).
        3. **Bảng Thông số / Kết quả Thực nghiệm**: Markdown table summarizing configurations, experiments, or comparisons.
        4. **Điểm Cốt lõi, Rủi ro & Mâu thuẫn**: Key takeaways plus a `> [!WARNING] Contradiction / Caveat` callout block highlighting limitations, risks, or tensions with other sources.
@@ -97,7 +101,7 @@ Follow the universal skills (`wiki-taxonomy` and `wiki-ingest`) and the `javis-o
 
 4. **Create or Merge Entity & Concept Pages + Bidirectional Source Links (BATCH IN PARALLEL TO SAVE TOKENS)**:
    - **CRITICAL TOKEN-SAVING RULE**: Emit multiple `wiki_write_file` and `wiki_patch_file` tool calls **in parallel within the same assistant turn** (1–2 batched turns total) instead of calling 1 tool per turn! Every extra turn resends the entire conversation history and multiplies token consumption.
-   - **CRITICAL OBSIDIAN LINK RULE**: In every `entities/*.md` and `concepts/*.md` page (especially in the `## Liên kết` section), write raw clickable Obsidian WikiLinks (`- **Entity**: [[entities/slug|Label]]`, `- **Source**: [[sources/...|File]]`), NEVER wrap `[[...]]` inside backticks (`` `[[...]]` ``)!
+   - **CRITICAL OBSIDIAN LINK RULE**: In every `entities/*.md` and `concepts/*.md` page (especially in the `## Liên kết` section), write raw clickable Obsidian WikiLinks (`- **Entity**: [[entities/slug|Label]]`, `- **Source**: [[sources/...|File]]`), NEVER wrap `[[...]]` inside backticks (`` `[[...]]` ``)! And for any external image or video URL, ALWAYS write `![label](url)` instead of `[label](url)`.
    - For each slug in `related_entities` (`entities/<domain>/<slug>.md` or `entities/shared/<slug>.md`) and `related_concepts` (`concepts/<domain>/<slug>.md`):
      - If it **does not exist** in `wiki/index.md` yet: call `wiki_write_file(scope="wiki", rel_path="entities/<domain>/<slug>.md" | "entities/shared/<slug>.md" | "concepts/<domain>/<slug>.md", content=...)` with full YAML frontmatter (`title`, `category`, `domain` (`"<domain>"` or `"shared"` for cross-domain tools), `topic`, `summary`, `aliases` (include abbreviations, English/Vietnamese synonyms, and auto-sub phonetic variants), `sources`, `tags`, `qmd.metadata`), opening with 1–2 self-contained positioning sentences (what it is, which domain it belongs to, when it is used), technical synthesis, and a link to `[[wiki/sources/<source_rel_path>|<Title>]]` and `[[sources/<source_rel_path>|<filename>]]`.
      - If it **already exists** in `wiki/index.md`: do NOT call `wiki_get` on it; directly call `wiki_patch_file(scope="wiki", rel_path="<existing_path>.md", append_text="\n- [[wiki/sources/<source_rel_path>|<Title>]] (Nguồn: [[sources/<source_rel_path>|<filename>]]) — <1 câu tổng hợp đóng góp/chi tiết mới từ tài liệu này>\n")`.
@@ -124,6 +128,7 @@ Follow these steps:
        - Links to core `[[entities/...]]` and `[[concepts/...]]` pages
        - A multi-line `flowchart LR` Mermaid diagram
        - Tags including `"topic/<domain>/<topic>"`
+       - Any image or video links formatted strictly as `![mô tả hoặc tiêu đề](url)` instead of `[link](url)`.
      - Call `wiki_patch_file(scope="wiki")` on the source pages in `sources/<domain>/<topic>/...` to append a link `- [[wiki/syntheses/<domain>/<topic-slug>-synthesis|<Title>]]` so the synthesis page has inbound links (no orphan pages!).
 
 3. **Run `wiki_lint` & Repair Loop**:
@@ -132,5 +137,5 @@ Follow these steps:
      - Fix every issue immediately using `wiki_patch_file`, `wiki_write_file`, or `wiki_delete_file`.
      - Re-run `wiki_lint` until `is_healthy: true`.
 
-4. Reply in Vietnamese summarizing the synthesis page(s) and confirming `wiki_lint` health status.
+4. Reply in Vietnamese summarizing the synthesis page(s) and confirming `wiki_lint` health status. (Lưu ý: Mọi link hình ảnh hoặc video trong Markdown đều phải dùng cú pháp `![mô tả hoặc tiêu đề](url)` thay vì `[link](url)`).
 "#;
