@@ -3,10 +3,31 @@ use crate::db::index_store::{
     get_document_info_by_id, resolve_path_context_for_doc, resolve_wiki_links_for_doc,
 };
 use crate::error::WikiResult;
+use crate::fs::file_ops::fold_vietnamese;
 use crate::search::{SearchOptions, SearchResultItem};
 use crate::types::CollectionScope;
 use rusqlite::{params, Connection};
 use std::collections::HashSet;
+
+const SYSTEM_CATALOG_SCORE_DAMPING: f32 = 0.60;
+
+/// Fold a string to lowercase with Vietnamese diacritics converted to ASCII (`Đ/đ -> d`, `ă/â -> a`, etc.).
+pub fn fold_vietnamese_str(s: &str) -> String {
+    s.chars()
+        .map(fold_vietnamese)
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Check if `rel_path` is an auto-generated system catalog/log (`wiki/index.md` or `wiki/log.md`)
+/// and the user's query is not explicitly asking for the index or log.
+pub fn is_system_catalog_doc(rel_path: &str, query: &str) -> bool {
+    if rel_path != "wiki/index.md" && rel_path != "wiki/log.md" {
+        return false;
+    }
+    let q_lower = query.to_ascii_lowercase();
+    !q_lower.contains("index") && !q_lower.contains("log") && !q_lower.contains("master")
+}
 
 fn run_fts_query(conn: &Connection, fts_q: &str, limit: i64) -> WikiResult<Vec<(i64, f64)>> {
     let mut stmt = conn.prepare(
@@ -77,23 +98,29 @@ pub fn search_fts_bm25(
 
         let abs_bm25 = raw_bm25.abs() as f32;
         // Normalize BM25 score (0..25+) into (0.0..1.0) using smooth saturation `x / (x + 2.5)`
-        let normalized_score = if abs_bm25 <= 0.0 {
+        let mut normalized_score = if abs_bm25 <= 0.0 {
             0.0
         } else {
             (abs_bm25 / (abs_bm25 + 2.5)).clamp(0.0, 1.0)
         };
+        if is_system_catalog_doc(&info.rel_path, query) {
+            normalized_score *= SYSTEM_CATALOG_SCORE_DAMPING;
+        }
 
         if normalized_score < opts.min_score {
             continue;
         }
 
-        let raw_body: String = conn.query_row(
-            "SELECT raw_body FROM documents WHERE id = ?1",
+        let (raw_body, line_count): (String, i64) = conn.query_row(
+            "SELECT raw_body, line_count FROM documents WHERE id = ?1",
             params![doc_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
 
-        let (snippet, match_line) = extract_best_snippet(&raw_body, query, 3);
+        let frontmatter_offset =
+            (line_count.max(0) as usize).saturating_sub(raw_body.lines().count());
+        let (snippet, rel_line) = extract_best_snippet(&raw_body, query, 3);
+        let match_line = frontmatter_offset + rel_line;
         let context = resolve_path_context_for_doc(conn, info.collection, &info.scoped_path)?;
         let (outgoing_links, backlinks, unresolved_links) =
             resolve_wiki_links_for_doc(conn, doc_id, &info.rel_path)?;
@@ -118,13 +145,27 @@ pub fn search_fts_bm25(
             unresolved_links,
             explain: None,
         });
-
-        if results.len() >= opts.limit {
-            break;
-        }
     }
 
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.rel_path.cmp(&b.rel_path))
+    });
+    results.truncate(opts.limit);
+
     Ok(results)
+}
+
+fn expand_vietnamese_d_variants(token: &str) -> (String, Option<String>) {
+    let ascii_d = token.replace('đ', "d").replace('Đ', "D");
+    let viet_d = ascii_d.replace('d', "đ").replace('D', "Đ");
+    if ascii_d != viet_d {
+        (ascii_d, Some(viet_d))
+    } else {
+        (ascii_d, None)
+    }
 }
 
 /// Sanitize a raw user query string into a valid SQLite FTS5 query string.
@@ -191,7 +232,12 @@ pub fn build_safe_fts5_query(raw_query: &str) -> String {
                 if is_negated {
                     clauses.push(format!("NOT \"{clean_token}\""));
                 } else {
-                    clauses.push(format!("\"{clean_token}\"*"));
+                    let (ascii_d, viet_d) = expand_vietnamese_d_variants(clean_token);
+                    if let Some(viet_d) = viet_d {
+                        clauses.push(format!("(\"{ascii_d}\"* OR \"{viet_d}\"*)"));
+                    } else {
+                        clauses.push(format!("\"{clean_token}\"*"));
+                    }
                 }
             }
         }
@@ -214,11 +260,17 @@ pub fn build_safe_fts5_query(raw_query: &str) -> String {
 }
 
 fn build_fallback_or_fts5_query(raw_query: &str) -> String {
-    let tokens: Vec<String> = raw_query
+    let mut tokens = Vec::new();
+    for s in raw_query
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .filter(|s| s.len() >= 2)
-        .map(|s| format!("\"{s}\"*"))
-        .collect();
+    {
+        let (ascii_d, viet_d) = expand_vietnamese_d_variants(s);
+        tokens.push(format!("\"{ascii_d}\"*"));
+        if let Some(viet_d) = viet_d {
+            tokens.push(format!("\"{viet_d}\"*"));
+        }
+    }
     tokens.join(" OR ")
 }
 
@@ -229,24 +281,47 @@ pub fn extract_best_snippet(body: &str, query: &str, context_lines: usize) -> (S
         return (String::new(), 1);
     }
 
-    let query_terms: Vec<String> = query
+    let exact_terms: Vec<String> = query
         .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|s| s.len() >= 2)
-        .map(|s| s.to_ascii_lowercase())
+        .filter(|s| s.chars().count() >= 2)
+        .map(|s| s.to_lowercase())
+        .collect();
+    let folded_terms: Vec<String> = exact_terms
+        .iter()
+        .map(|s| fold_vietnamese_str(s))
         .collect();
 
     let mut best_line_idx = 0usize;
-    let mut best_hits = 0usize;
+    let mut best_score = 0usize;
 
-    if !query_terms.is_empty() {
+    if !folded_terms.is_empty() {
         for (idx, line) in lines.iter().enumerate() {
-            let line_lower = line.to_ascii_lowercase();
-            let hits = query_terms
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let line_lower = line.to_lowercase();
+            let line_folded = fold_vietnamese_str(line);
+
+            let folded_hits = folded_terms
+                .iter()
+                .filter(|t| line_folded.contains(t.as_str()))
+                .count();
+            if folded_hits == 0 {
+                continue;
+            }
+            let exact_hits = exact_terms
                 .iter()
                 .filter(|t| line_lower.contains(t.as_str()))
                 .count();
-            if hits > best_hits {
-                best_hits = hits;
+            let is_reference_only = trimmed.starts_with("> **Raw Sources:**")
+                || trimmed.starts_with("- **Source")
+                || trimmed.starts_with("- Raw source:");
+            let prose_bonus = usize::from(!is_reference_only);
+            let score = folded_hits * 4 + exact_hits * 2 + prose_bonus;
+
+            if score > best_score {
+                best_score = score;
                 best_line_idx = idx;
             }
         }

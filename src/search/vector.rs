@@ -4,10 +4,16 @@ use crate::db::index_store::{
 };
 use crate::db::schema::encode_f32_blob;
 use crate::error::WikiResult;
+use crate::search::fts::{extract_best_snippet, fold_vietnamese_str, is_system_catalog_doc};
 use crate::search::{ExpandedQuery, SearchOptions, SearchResultItem};
 use crate::types::{CollectionScope, EmbedStats};
 use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
+
+/// Minimum vector score (`1 / (1 + distance)`) required when `opts.min_score == 0.0`.
+/// Filters out orthogonal/random hash-collision noise (`distance >= 0.87`, `cosine <= 0.13`).
+const DEFAULT_MIN_VEC_SCORE: f32 = 0.535;
+const SYSTEM_CATALOG_VEC_DAMPING: f32 = 0.85;
 
 /// Pluggable Vector Embedding Provider trait (supports local GGUF/FastEmbed or remote OpenAI/Ollama).
 pub trait EmbeddingProvider: Send + Sync {
@@ -62,6 +68,10 @@ impl LocalNgramEmbedder {
 
         for (i, &w) in words.iter().enumerate() {
             self.Accumulate_token(&mut vec, w, 2.0);
+            let folded = fold_vietnamese_str(w);
+            if folded != w {
+                self.Accumulate_token(&mut vec, &folded, 1.5);
+            }
             if i + 1 < words.len() {
                 let bigram = format!("{}_{}", w, words[i + 1]);
                 self.Accumulate_token(&mut vec, &bigram, 1.5);
@@ -250,6 +260,8 @@ pub fn search_vector(
     let mut best_by_doc: HashMap<i64, (f32, String, usize)> = HashMap::new();
     let mut doc_order: Vec<i64> = Vec::new();
 
+    let effective_min_score = opts.min_score.max(DEFAULT_MIN_VEC_SCORE);
+
     for row in rows {
         let (doc_id, coll_str, chunk_text, start_line, distance) = row?;
         if !allowed_collections.contains(coll_str.as_str()) {
@@ -263,7 +275,7 @@ pub fn search_vector(
 
         // QMD score conversion: `1 / (1 + distance)`
         let score = (1.0 / (1.0 + distance.max(0.0))).clamp(0.0, 1.0);
-        if score < opts.min_score {
+        if score < effective_min_score {
             continue;
         }
 
@@ -275,15 +287,17 @@ pub fn search_vector(
 
     let mut results = Vec::new();
     for doc_id in doc_order {
-        if let Some((score, chunk_text, start_line)) = best_by_doc.remove(&doc_id) {
+        if let Some((raw_score, chunk_text, start_line)) = best_by_doc.remove(&doc_id) {
             let info = get_document_info_by_id(conn, doc_id)?;
-            let snippet = chunk_text
-                .lines()
-                .take(4)
-                .collect::<Vec<_>>()
-                .join("\n")
-                .trim()
-                .to_string();
+            let mut score = raw_score;
+            if is_system_catalog_doc(&info.rel_path, query) {
+                score *= SYSTEM_CATALOG_VEC_DAMPING;
+            }
+            if score < opts.min_score {
+                continue;
+            }
+            let (snippet, rel_line) = extract_best_snippet(&chunk_text, query, 3);
+            let match_line = start_line + rel_line.saturating_sub(1);
             let context = resolve_path_context_for_doc(conn, info.collection, &info.scoped_path)?;
             let (outgoing_links, backlinks, unresolved_links) =
                 resolve_wiki_links_for_doc(conn, doc_id, &info.rel_path)?;
@@ -297,8 +311,8 @@ pub fn search_vector(
                 title: info.title,
                 collection: info.collection,
                 score,
-                raw_backend_score: score,
-                match_line: start_line,
+                raw_backend_score: raw_score,
+                match_line,
                 snippet,
                 context,
                 metadata: info.metadata,
@@ -308,12 +322,16 @@ pub fn search_vector(
                 unresolved_links,
                 explain: None,
             });
-
-            if results.len() >= opts.limit {
-                break;
-            }
         }
     }
+
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.rel_path.cmp(&b.rel_path))
+    });
+    results.truncate(opts.limit);
 
     Ok(results)
 }

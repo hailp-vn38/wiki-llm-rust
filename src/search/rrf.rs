@@ -1,5 +1,5 @@
 use crate::error::WikiResult;
-use crate::search::fts::search_fts_bm25;
+use crate::search::fts::{is_system_catalog_doc, search_fts_bm25};
 use crate::search::vector::{search_vector, EmbeddingProvider, RerankProvider};
 use crate::search::{
     HybridQueryRequest, RrfContribution, RrfExplainTrace, SearchExplainTrace, SearchOptions,
@@ -11,6 +11,8 @@ use std::collections::HashMap;
 const RRF_K: f32 = 60.0;
 const TOP_1_BONUS: f32 = 0.05;
 const TOP_2_3_BONUS: f32 = 0.02;
+const SYSTEM_CATALOG_RRF_DAMPING: f32 = 0.60;
+const WEAK_VECTOR_ONLY_CUTOFF: f32 = 0.565;
 
 struct RankedDocAccumulator {
     item: SearchResultItem,
@@ -147,9 +149,28 @@ pub fn execute_hybrid_query(
         return Ok(Vec::new());
     }
 
+    let primary_query = req
+        .query
+        .as_deref()
+        .or_else(|| sub_queries.first().map(|s| s.query.as_str()))
+        .unwrap_or("");
+
+    let has_any_fts_hit = accumulators.values().any(|acc| !acc.fts_scores.is_empty());
+
     // Compute total RRF score with Top-Rank Bonus
     let mut fused: Vec<(f32, f32, RankedDocAccumulator)> = accumulators
         .into_values()
+        .filter(|acc| {
+            if !has_any_fts_hit || !acc.fts_scores.is_empty() {
+                return true;
+            }
+            let max_vec = acc
+                .vector_scores
+                .iter()
+                .copied()
+                .fold(0.0f32, f32::max);
+            max_vec >= WEAK_VECTOR_ONLY_CUTOFF
+        })
         .map(|acc| {
             let bonus = if acc.best_rank == 0 {
                 TOP_1_BONUS
@@ -158,10 +179,17 @@ pub fn execute_hybrid_query(
             } else {
                 0.0
             };
-            let total_rrf = acc.base_rrf_score + bonus;
+            let mut total_rrf = acc.base_rrf_score + bonus;
+            if is_system_catalog_doc(&acc.item.rel_path, primary_query) {
+                total_rrf *= SYSTEM_CATALOG_RRF_DAMPING;
+            }
             (total_rrf, bonus, acc)
         })
         .collect();
+
+    if fused.is_empty() {
+        return Ok(Vec::new());
+    }
 
     fused.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)
@@ -175,11 +203,6 @@ pub fn execute_hybrid_query(
     let max_rrf = fused.first().map(|x| x.0).unwrap_or(1.0).max(0.05);
 
     // Optional Reranker step + Position-Aware Blending
-    let primary_query = req
-        .query
-        .as_deref()
-        .or_else(|| sub_queries.first().map(|s| s.query.as_str()))
-        .unwrap_or("");
 
     let rerank_scores: Option<Vec<f32>> = if req.rerank {
         if let Some(rr) = reranker {
