@@ -24,6 +24,20 @@ pub struct WikiLintReport {
     pub missing_frontmatter_pages: Vec<String>,
     /// Summary status: `true` if there are no broken links, orphans, stale pages, or uningested sources.
     pub is_healthy: bool,
+    /// Source summary pages whose ingest is not finished: entity/concept pages they announce do not
+    /// exist yet, or their raw source changed after the page was written.
+    #[serde(default)]
+    pub incomplete_ingests: Vec<IncompleteIngestItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncompleteIngestItem {
+    pub source_rel_path: String,
+    pub wiki_rel_path: String,
+    /// Entity/concept link targets announced by the summary page that do not resolve yet.
+    pub missing_targets: Vec<String>,
+    /// The raw source is newer than its summary page.
+    pub source_updated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,6 +324,35 @@ pub fn run_wiki_lint(conn: &Connection, config: &WikiConfig) -> WikiResult<WikiL
         }
     }
 
+    let mut incomplete_ingests = Vec::new();
+    for doc in &wiki_docs {
+        let Some(source_rel_path) = doc.source_rel_path.as_ref() else {
+            continue;
+        };
+        if !doc.scoped_path.starts_with("sources/") {
+            continue;
+        }
+        let mut missing_targets: Vec<String> = broken_links
+            .iter()
+            .filter(|b| b.source_rel_path == doc.rel_path)
+            .map(|b| b.target_path_spec.trim_start_matches("wiki/").to_string())
+            .filter(|t| t.starts_with("entities/") || t.starts_with("concepts/"))
+            .collect();
+        missing_targets.sort();
+        missing_targets.dedup();
+        let source_updated = stale_wiki_pages
+            .iter()
+            .any(|s: &StaleWikiPageItem| s.wiki_rel_path == doc.rel_path);
+        if !missing_targets.is_empty() || source_updated {
+            incomplete_ingests.push(IncompleteIngestItem {
+                source_rel_path: source_rel_path.clone(),
+                wiki_rel_path: doc.rel_path.clone(),
+                missing_targets,
+                source_updated,
+            });
+        }
+    }
+
     let is_healthy = uningested_sources.is_empty()
         && broken_links.is_empty()
         && orphan_wiki_pages.is_empty()
@@ -324,6 +367,7 @@ pub fn run_wiki_lint(conn: &Connection, config: &WikiConfig) -> WikiResult<WikiL
         flagged_contradictions_or_gaps,
         missing_frontmatter_pages,
         is_healthy,
+        incomplete_ingests,
     })
 }
 

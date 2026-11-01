@@ -11,21 +11,6 @@ pub mod types;
 pub mod wiki;
 
 pub use config::{ChunkConfig, WikiConfig, WikiSourceLayout};
-pub use prompts::{
-    all_wiki_templates, apply_wikilink_substitutions, build_chunk_analysis_system_prompt,
-    build_chunk_analysis_user_prompt, build_enrich_wikilinks_system_prompt,
-    build_evidence_quality_gate_system_prompt, build_ingest_analysis_prompt,
-    build_ingest_batch_generation_prompt, build_ingest_tool_agent_prompt,
-    build_language_directive, build_language_reminder, build_page_merge_system_prompt,
-    build_page_merge_user_prompt, build_query_agent_system_prompt,
-    build_research_synthesis_prompt, build_semantic_lint_prompt,
-    build_truncated_file_repair_prompt, detect_language_prompt_name, get_wiki_template,
-    is_safe_ingest_wiki_path, parse_file_blocks, parse_review_blocks, parse_semantic_lint_blocks,
-    IngestPromptContext, OutputLanguage, ParseFileBlocksResult, ParsedFileBlock,
-    ParsedReviewBlock, ParsedSemanticLintBlock, ReviewBlockType, SemanticLintIssueType,
-    WikiRetrievalMode, WikiTemplate, WikiTemplateId, WikilinkSubstitution, ROOT_DISPATCHER_PROMPT,
-    SOURCE_COLLECTOR_PROMPT, WIKI_CURATOR_PROMPT, WIKI_INGESTOR_PROMPT,
-};
 pub use db::filter_sql::{
     ComparisonOperator, LogicalOperator, MetadataCondition, MetadataFilter, NotOperator,
 };
@@ -42,6 +27,20 @@ pub use markdown::chunker::{smart_chunk_markdown, MarkdownChunk};
 pub use markdown::frontmatter::{parse_frontmatter, ParsedFrontmatter, TypedMetaValue};
 pub use markdown::parser::{
     parse_markdown_document, ExtractedLink, ExtractedLinkType, HeadingInfo, ParsedMarkdownDoc,
+};
+pub use prompts::{
+    all_wiki_templates, apply_wikilink_substitutions, build_chunk_analysis_system_prompt,
+    build_chunk_analysis_user_prompt, build_enrich_wikilinks_system_prompt,
+    build_evidence_quality_gate_system_prompt, build_ingest_analysis_prompt,
+    build_ingest_batch_generation_prompt, build_ingest_tool_agent_prompt, build_language_directive,
+    build_language_reminder, build_page_merge_system_prompt, build_page_merge_user_prompt,
+    build_query_agent_system_prompt, build_research_synthesis_prompt, build_semantic_lint_prompt,
+    build_truncated_file_repair_prompt, detect_language_prompt_name, get_wiki_template,
+    is_safe_ingest_wiki_path, parse_file_blocks, parse_review_blocks, parse_semantic_lint_blocks,
+    IngestPromptContext, OutputLanguage, ParseFileBlocksResult, ParsedFileBlock, ParsedReviewBlock,
+    ParsedSemanticLintBlock, ReviewBlockType, SemanticLintIssueType, WikiRetrievalMode,
+    WikiTemplate, WikiTemplateId, WikilinkSubstitution, ROOT_DISPATCHER_PROMPT,
+    SOURCE_COLLECTOR_PROMPT, WIKI_CURATOR_PROMPT, WIKI_INGESTOR_PROMPT,
 };
 pub use search::metadata::{
     DiscoveredMetadataKey, DiscoveredMetadataTypeBucket, DiscoveredValueCount,
@@ -63,8 +62,8 @@ pub use wiki::ingest::{
     IngestSourceRequest, IngestSourceResponse, WriteTopicSourceRequest, WriteTopicSourceResponse,
 };
 pub use wiki::linter::{
-    BrokenLinkItem, FlaggedClaimItem, StaleWikiPageItem, UningestedSourceItem, UnlinkedMentionItem,
-    WikiLintReport,
+    BrokenLinkItem, FlaggedClaimItem, IncompleteIngestItem, StaleWikiPageItem,
+    UningestedSourceItem, UnlinkedMentionItem, WikiLintReport,
 };
 pub use wiki::log_md::{LogAction, LogEntry};
 
@@ -100,6 +99,39 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+/// Options for [`WikiEngine::plan_next_autoflow`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AutoflowPlanOptions<'a> {
+    /// Maximum sources handed to one stage; `None` hands over all of them.
+    pub max_sources: Option<usize>,
+    /// Quarantined `sources/...` paths: neither planned nor counted as unhealthy.
+    pub exclude_sources: &'a [String],
+}
+
+/// The next Auto-Flow stage: its prompt and the `sources/...` paths it is responsible for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoflowPlan {
+    pub prompt: String,
+    pub ingest_batch: Vec<String>,
+}
+
+/// How far a raw source has progressed into `wiki/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceIngestState {
+    NotIngested,
+    /// A summary page exists, but pages it announces are missing or the source changed since.
+    Incomplete,
+    Ingested,
+}
+
+/// A raw source found by [`WikiEngine::find_source_by_frontmatter`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceMatch {
+    pub rel_path: String,
+    pub scoped_path: String,
+    pub ingest_state: SourceIngestState,
+}
 
 /// Main entry point for the `llm-wiki` library.
 ///
@@ -268,10 +300,8 @@ impl WikiEngine {
             .unwrap_or(&domain)
             .to_string();
         let info = self.write_source_file(&scoped_path, &raw_md)?;
-        let expected_wiki_path = format!(
-            "{}/sources/{}",
-            self.config.wiki_dir_name, info.scoped_path
-        );
+        let expected_wiki_path =
+            format!("{}/sources/{}", self.config.wiki_dir_name, info.scoped_path);
         let preview_limit = req.preview_chars.filter(|&n| n > 0).unwrap_or(600);
         let short_preview = clip_transcript(&req.raw_body, preview_limit);
         let agent_output = format!(
@@ -331,8 +361,7 @@ impl WikiEngine {
         } else {
             clean_scoped_input.to_string()
         };
-        let (clean_scoped, full_path) =
-            write_nested_file(&base_dir, &target_scoped, &sanitized)?;
+        let (clean_scoped, full_path) = write_nested_file(&base_dir, &target_scoped, &sanitized)?;
 
         let (info, _) =
             index_single_file(&conn, &self.config, scope, &clean_scoped, &full_path, true)?;
@@ -484,8 +513,10 @@ impl WikiEngine {
             });
         }
 
-        let (wiki_scoped_path, file_name) = if let Some(ref custom_target) =
-            req.target_wiki_path.as_ref().filter(|s| !s.trim().is_empty())
+        let (wiki_scoped_path, file_name) = if let Some(ref custom_target) = req
+            .target_wiki_path
+            .as_ref()
+            .filter(|s| !s.trim().is_empty())
         {
             let clean_target = ensure_markdown_extension(custom_target)?;
             let prefix = format!("{}/", self.config.wiki_dir_name);
@@ -596,10 +627,7 @@ impl WikiEngine {
         let mut written_rel_paths = Vec::new();
 
         for block in &parsed.blocks {
-            let scoped = block
-                .path
-                .strip_prefix("wiki/")
-                .unwrap_or(&block.path);
+            let scoped = block.path.strip_prefix("wiki/").unwrap_or(&block.path);
             if scoped == "index.md" || scoped == "log.md" {
                 continue;
             }
@@ -965,63 +993,212 @@ impl WikiEngine {
         &self,
         initial_collection_prompt: Option<&str>,
     ) -> WikiResult<Option<String>> {
+        Ok(self
+            .plan_next_autoflow(initial_collection_prompt, &AutoflowPlanOptions::default())?
+            .map(|plan| plan.prompt))
+    }
+
+    /// Like [`Self::build_next_autoflow_prompt`], but limits how many sources the next stage takes
+    /// and skips quarantined ones, reporting exactly which sources the stage is responsible for.
+    pub fn plan_next_autoflow(
+        &self,
+        initial_collection_prompt: Option<&str>,
+        options: &AutoflowPlanOptions<'_>,
+    ) -> WikiResult<Option<AutoflowPlan>> {
         let _ = self.rebuild_or_sync_index_md();
         let status = self.status()?;
         if status.sources_count == 0 {
-            return Ok(initial_collection_prompt.map(ToString::to_string));
+            return Ok(initial_collection_prompt.map(|prompt| AutoflowPlan {
+                prompt: prompt.to_string(),
+                ingest_batch: Vec::new(),
+            }));
         }
 
         let lint = self.lint_wiki()?;
+        let excluded = |path: &str| options.exclude_sources.iter().any(|e| e == path);
 
-        if !lint.uningested_sources.is_empty() {
-            let first_rel = lint.uningested_sources[0]
-                .source_rel_path
-                .trim_start_matches("sources/");
+        let mut pending: Vec<String> = lint
+            .uningested_sources
+            .iter()
+            .map(|s| s.source_rel_path.clone())
+            .chain(
+                lint.incomplete_ingests
+                    .iter()
+                    .map(|i| i.source_rel_path.clone()),
+            )
+            .filter(|path| !excluded(path))
+            .collect();
+        pending.dedup();
+
+        if !pending.is_empty() {
+            let total = pending.len();
+            let batch_size = options.max_sources.unwrap_or(total).clamp(1, total);
+            pending.truncate(batch_size);
+            let first_rel = pending[0].trim_start_matches("sources/");
             let preferred_topic = extract_topic_from_doc(first_rel, "source_summary", None);
             let compact_index = self
                 .read_compact_index_md_for_topic(2_500, preferred_topic.as_deref())
                 .unwrap_or_default();
 
-            let new_sources_list = lint
-                .uningested_sources
+            let new_sources_list = pending
                 .iter()
-                .map(|s| format!("- `{}`", s.source_rel_path.trim_start_matches("sources/")))
+                .map(|path| {
+                    let line = format!("- `{}`", path.trim_start_matches("sources/"));
+                    match lint
+                        .incomplete_ingests
+                        .iter()
+                        .find(|i| &i.source_rel_path == path)
+                    {
+                        Some(item) if item.source_updated => format!(
+                            "{line} — nguồn đã được cập nhật: ingest lại và gộp vào `{}`, giữ nguyên các nội dung cũ còn đúng",
+                            item.wiki_rel_path
+                        ),
+                        Some(item) => format!(
+                            "{line} — ingest dở: đã có `{}` nhưng còn thiếu {}; chỉ tạo các trang còn thiếu, không ingest lại từ đầu",
+                            item.wiki_rel_path,
+                            item.missing_targets
+                                .iter()
+                                .map(|t| format!("`{t}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        None => line,
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
-            return Ok(Some(format!(
-                "[AUTO-FLOW: NEW SOURCES DETECTED]\n\
-                 Hệ thống phát hiện {} tài liệu mới trong `sources/` chưa được ingest vào `wiki/`:\n{}\n\n\
-                 === CURRENT COMPACT WIKI INDEX ===\n{}\n\
-                 ==================================\n\n\
-                 Hãy điều phối subagent `wiki_ingestor` (gọi tuần tự từng file một) để ingest toàn bộ các file mới này vào `wiki/`, sau đó gọi `wiki_curator` để tổng hợp Synthesis theo từng chủ đề và chạy `wiki_lint`.",
-                lint.uningested_sources.len(),
-                new_sources_list,
-                compact_index.trim()
-            )));
+            let remaining = total - batch_size;
+            let remaining_note = if remaining > 0 {
+                format!("\nHệ thống còn {remaining} tài liệu khác sẽ được xử lý ở task sau; chỉ xử lý các file đã liệt kê.\n")
+            } else {
+                String::new()
+            };
+            return Ok(Some(AutoflowPlan {
+                prompt: format!(
+                    "[AUTO-FLOW: NEW SOURCES DETECTED]\n\
+                     Hệ thống phát hiện {} tài liệu cần ingest từ `sources/` vào `wiki/`:\n{}\n{}\n\
+                     === CURRENT COMPACT WIKI INDEX ===\n{}\n\
+                     ==================================\n\n\
+                     Hãy điều phối subagent `wiki_ingestor` (gọi tuần tự từng file một) cho các file trên. Không gọi `wiki_curator`: hệ thống tạo chặng tổng hợp riêng khi hàng đợi đã hết. Báo rõ file nào thất bại.",
+                    batch_size,
+                    new_sources_list,
+                    remaining_note,
+                    compact_index.trim()
+                ),
+                ingest_batch: pending,
+            }));
         }
 
+        let is_excluded_page = |page: &str| {
+            lint.incomplete_ingests
+                .iter()
+                .any(|i| i.wiki_rel_path == page && excluded(&i.source_rel_path))
+        };
+        let broken_links: Vec<_> = lint
+            .broken_links
+            .iter()
+            .filter(|b| !is_excluded_page(&b.source_rel_path))
+            .collect();
+        let healthy = broken_links.is_empty()
+            && lint.orphan_wiki_pages.is_empty()
+            && lint
+                .stale_wiki_pages
+                .iter()
+                .all(|s| is_excluded_page(&s.wiki_rel_path));
+
         let unsynthesized = self.unsynthesized_topics().unwrap_or_default();
-        if !unsynthesized.is_empty() || !lint.is_healthy {
+        if !unsynthesized.is_empty() || !healthy {
             let preferred_topic = unsynthesized.first().map(String::as_str);
             let compact_index = self
                 .read_compact_index_md_for_topic(2_500, preferred_topic)
                 .unwrap_or_default();
 
-            return Ok(Some(format!(
-                "[AUTO-FLOW: WIKI LINT]\n\
-                 Trạng thái Wiki hiện tại: `unsynthesized_topics={:?}`, `broken_links={:?}`, `orphan_wiki_pages={:?}`.\n\n\
-                 === CURRENT COMPACT WIKI INDEX ===\n{}\n\
-                 ==================================\n\n\
-                 Hãy điều phối subagent `wiki_curator` để:\n\
-                 1. Nếu `unsynthesized_topics` không rỗng: tạo trang tổng hợp `wiki/syntheses/<topic-slug>-synthesis.md` cho từng chủ đề trong `unsynthesized_topics` và gắn link hai chiều từ các trang `wiki/sources/<domain>/<topic>/...`.\n\
-                 2. Sửa toàn bộ `broken_links` và `orphan_wiki_pages`, sau đó chạy `wiki_lint` đảm bảo `is_healthy: true`.",
-                unsynthesized,
-                lint.broken_links,
-                lint.orphan_wiki_pages,
-                compact_index.trim()
-            )));
+            return Ok(Some(AutoflowPlan {
+                prompt: format!(
+                    "[AUTO-FLOW: WIKI LINT]\n\
+                     Trạng thái Wiki hiện tại: `unsynthesized_topics={:?}`, `broken_links={:?}`, `orphan_wiki_pages={:?}`.\n\n\
+                     === CURRENT COMPACT WIKI INDEX ===\n{}\n\
+                     ==================================\n\n\
+                     Hãy điều phối subagent `wiki_curator` để:\n\
+                     1. Nếu `unsynthesized_topics` không rỗng: tạo trang tổng hợp `wiki/syntheses/<topic-slug>-synthesis.md` cho từng chủ đề trong `unsynthesized_topics` và gắn link hai chiều từ các trang `wiki/sources/<domain>/<topic>/...`.\n\
+                     2. Sửa toàn bộ `broken_links` và `orphan_wiki_pages`, sau đó chạy `wiki_lint` đảm bảo `is_healthy: true`.",
+                    unsynthesized,
+                    broken_links,
+                    lint.orphan_wiki_pages,
+                    compact_index.trim()
+                ),
+                ingest_batch: Vec::new(),
+            }));
         }
 
         Ok(None)
+    }
+
+    /// Find a raw source by an identity stored in its frontmatter (`video_id`, `content_sha256`, ...),
+    /// independent of its file name. Returns the first match in path order.
+    pub fn find_source_by_frontmatter(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> WikiResult<Option<SourceMatch>> {
+        Ok(self.sources_by_frontmatter(key)?.remove(value))
+    }
+
+    /// Every raw source that has frontmatter `key`, by value, with its ingest state. Runs one lint,
+    /// so looking up many identities through this map costs the same as looking up one.
+    pub fn sources_by_frontmatter(
+        &self,
+        key: &str,
+    ) -> WikiResult<std::collections::HashMap<String, SourceMatch>> {
+        let mut out = std::collections::HashMap::new();
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Ok(out);
+        }
+        let rows: Vec<(String, String, String)> = {
+            let conn = self.db.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT CAST(json_extract(frontmatter_json, ?1) AS TEXT), rel_path, scoped_path
+                 FROM documents
+                 WHERE collection = 'sources' AND json_extract(frontmatter_json, ?1) IS NOT NULL
+                 ORDER BY rel_path DESC",
+            )?;
+            let found = stmt
+                .query_map(rusqlite::params![format!("$.{key}")], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            found
+        };
+        if rows.is_empty() {
+            return Ok(out);
+        }
+        let lint = self.lint_wiki()?;
+        for (value, rel_path, scoped_path) in rows {
+            let ingest_state = if lint
+                .uningested_sources
+                .iter()
+                .any(|s| s.source_rel_path == rel_path)
+            {
+                SourceIngestState::NotIngested
+            } else if lint
+                .incomplete_ingests
+                .iter()
+                .any(|i| i.source_rel_path == rel_path)
+            {
+                SourceIngestState::Incomplete
+            } else {
+                SourceIngestState::Ingested
+            };
+            // Sorted descending: the first path in ascending order wins.
+            out.insert(
+                value,
+                SourceMatch {
+                    rel_path,
+                    scoped_path,
+                    ingest_state,
+                },
+            );
+        }
+        Ok(out)
     }
 }
