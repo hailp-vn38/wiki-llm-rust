@@ -30,6 +30,19 @@ pub struct WikiLintReport {
     pub incomplete_ingests: Vec<IncompleteIngestItem>,
 }
 
+impl WikiLintReport {
+    /// `source_rel_path` (`sources/...`) still has ingest work left.
+    pub fn is_source_pending(&self, source_rel_path: &str) -> bool {
+        self.uningested_sources
+            .iter()
+            .any(|s| s.source_rel_path == source_rel_path)
+            || self
+                .incomplete_ingests
+                .iter()
+                .any(|i| i.source_rel_path == source_rel_path)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncompleteIngestItem {
     pub source_rel_path: String,
