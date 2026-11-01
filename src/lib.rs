@@ -70,7 +70,7 @@ pub use wiki::log_md::{LogAction, LogEntry};
 use crate::db::index_store::{
     get_all_path_contexts, index_single_file, load_tree_metadata_map, multi_get_documents,
     remove_document_by_rel_path, resolve_canonical_wiki_scoped_path, retrieve_document,
-    sync_filesystem, upsert_path_context,
+    sync_filesystem, upgrade_fts_content, upsert_path_context,
 };
 use crate::db::schema::init_database;
 use crate::fs::file_ops::{delete_nested_file, move_nested_file, write_nested_file};
@@ -213,6 +213,7 @@ impl WikiEngine {
 
         // 5. Sync existing files on disk into SQLite
         sync_filesystem(&conn, &config)?;
+        upgrade_fts_content(&conn)?;
 
         Ok(Self {
             config,

@@ -8,7 +8,7 @@ use crate::fs::tree::TreeDocMeta;
 use crate::graph::link_resolver::resolve_all_links_in_db;
 use crate::markdown::chunker::smart_chunk_markdown;
 use crate::markdown::frontmatter::{parse_frontmatter, TypedMetaValue};
-use crate::markdown::parser::parse_markdown_document;
+use crate::markdown::parser::{parse_markdown_document, strip_wikilink_targets};
 use crate::types::{
     CollectionScope, DocumentInfo, DocumentResult, GetOptions, MultiGetError, MultiGetOptions,
     MultiGetResult, PathContextItem, SyncStats,
@@ -20,6 +20,29 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
+
+/// Bump when the text stored in `documents_fts` changes, so existing vaults get re-tokenized.
+const FTS_CONTENT_VERSION: i64 = 1;
+
+/// Rewrite FTS bodies from `documents.raw_body` when the index predates the current FTS content.
+pub fn upgrade_fts_content(conn: &Connection) -> WikiResult<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= FTS_CONTENT_VERSION {
+        return Ok(());
+    }
+    let docs: Vec<(i64, String)> = conn
+        .prepare("SELECT id, raw_body FROM documents")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    for (id, raw_body) in docs {
+        conn.execute(
+            "UPDATE documents_fts SET body = ?1 WHERE rowid = ?2",
+            params![strip_wikilink_targets(&raw_body), id],
+        )?;
+    }
+    conn.pragma_update(None, "user_version", FTS_CONTENT_VERSION)?;
+    Ok(())
+}
 
 /// Index or update a single Markdown file into SQLite (`documents`, `documents_fts`, `content_chunks`, `document_metadata`, `graph_links`).
 pub fn index_single_file(
@@ -251,7 +274,7 @@ pub fn index_single_file(
             collection.as_str(),
             parsed.title,
             headings_joined,
-            parsed.frontmatter.body,
+            strip_wikilink_targets(&parsed.frontmatter.body),
             tags_joined,
         ],
     )?;
@@ -775,9 +798,7 @@ fn find_document_id_flexible(conn: &Connection, target: &str) -> WikiResult<Opti
             "SELECT id, aliases_json FROM documents
              ORDER BY CASE WHEN collection = 'wiki' THEN 0 ELSE 1 END, length(rel_path) ASC",
         )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-        })?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         for row in rows {
             let (id, aliases_json) = row?;
             let aliases: Vec<String> = serde_json::from_str(&aliases_json).unwrap_or_default();
@@ -834,8 +855,7 @@ fn find_similar_files(conn: &Connection, query: &str, limit: usize) -> WikiResul
         // Number-guard from `javis-os` `_wiki_trung`: if both strings contain numbers and they differ
         // (e.g., "IFRS 7" vs "IFRS 9", or "01-video" vs "02-video"), penalize fuzzy similarity heavily.
         let cand_nums = extract_numbers(&stem_l);
-        let number_mismatch =
-            !q_nums.is_empty() && !cand_nums.is_empty() && q_nums != cand_nums;
+        let number_mismatch = !q_nums.is_empty() && !cand_nums.is_empty() && q_nums != cand_nums;
 
         let alias_match = aliases
             .iter()
@@ -1298,16 +1318,17 @@ pub fn heal_category_wikilinks_in_markdown(
 
 /// Synchronize category-prefixed `[[WikiLinks]]` on disk for any `wiki` pages whose link targets
 /// (`entities/...`, `concepts/...`, `syntheses/...`) are stored inside `<domain>` subfolders.
-pub fn heal_category_wikilinks_on_disk(conn: &Connection, config: &WikiConfig) -> WikiResult<usize> {
+pub fn heal_category_wikilinks_on_disk(
+    conn: &Connection,
+    config: &WikiConfig,
+) -> WikiResult<usize> {
     let mut cat_stmt = conn.prepare(
         "SELECT scoped_path, file_stem
          FROM documents
          WHERE collection = 'wiki'
            AND (scoped_path LIKE 'entities/%' OR scoped_path LIKE 'concepts/%' OR scoped_path LIKE 'syntheses/%')",
     )?;
-    let rows = cat_stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-    })?;
+    let rows = cat_stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
 
     let mut canonical_map: HashMap<(String, String), String> = HashMap::new();
     for row in rows {
@@ -1346,7 +1367,10 @@ pub fn heal_category_wikilinks_on_disk(conn: &Connection, config: &WikiConfig) -
     let mut files_to_heal: BTreeSet<(String, String)> = BTreeSet::new();
     for row in link_rows {
         let (src_scoped, src_rel, target_spec) = row?;
-        let spec_clean = target_spec.trim().trim_start_matches('/').replace('\\', "/");
+        let spec_clean = target_spec
+            .trim()
+            .trim_start_matches('/')
+            .replace('\\', "/");
         let spec_lower = spec_clean.to_ascii_lowercase();
         let without_wiki = spec_lower.strip_prefix("wiki/").unwrap_or(&spec_lower);
         let without_wiki_no_md = without_wiki.strip_suffix(".md").unwrap_or(without_wiki);

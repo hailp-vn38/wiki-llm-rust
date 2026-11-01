@@ -16,7 +16,7 @@ Choose the right tool for the question:
    - Each result automatically includes resolved `[[WikiLinks]]` relationships (`is_wiki_linked`, `outgoing_links`, `backlinks`, and `unresolved_links`).
    - Use typed sub-queries for high-precision retrieval:
      - `lex`: BM25 exact keyword/identifier match (e.g., function names, error codes, metrics).
-     - `vec`: Semantic similarity search.
+     - `vec`: Semantic similarity search when a neural embedder is configured; otherwise answered lexically.
      - `hyde`: Hypothetical document passage matching the ideal answer.
    - Put the highest-signal sub-query first (it receives $2\times$ RRF weight).
    - Use `filter` (QMD metadata AST) when narrowing by `category`, `tags`, or `source_file` (discover available keys first with `wiki_metadata` if unsure).

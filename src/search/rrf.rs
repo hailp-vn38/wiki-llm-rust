@@ -24,15 +24,19 @@ struct RankedDocAccumulator {
 }
 
 /// Execute the full QMD Hybrid Search Pipeline:
-/// 1. Route typed sub-queries (`lex` -> FTS5 BM25, `vec`/`hyde` -> Vector Search).
-///    First sub-query gets 2x weight; subsequent sub-queries get 1x weight.
+/// 1. Route typed sub-queries (`lex` -> FTS5 BM25, `vec`/`hyde` -> Vector Search, or FTS5 when the
+///    embedder is not semantic). First sub-query gets 2x weight; subsequent sub-queries get 1x.
 /// 2. Reciprocal Rank Fusion (`k = 60`): `sum(weight / (k + rank + 1))`
-/// 3. Top-Rank Bonus: `+0.05` if Rank #1 in any list, `+0.02` if Rank #2 or #3.
+/// 3. Top-Rank Bonus for documents with a lexical hit: `+0.05` if Rank #1 in any list, `+0.02` if
+///    Rank #2 or #3. Vector-only documents below the weak cutoff are dropped.
 /// 4. Top-K selection (`candidate_limit`, default 40) -> Optional Cross-Encoder Reranking.
 /// 5. Position-Aware Blending:
 ///    - RRF Rank 1-3:  75% RRF + 25% Reranker
 ///    - RRF Rank 4-10: 60% RRF + 40% Reranker
 ///    - RRF Rank 11+:  40% RRF + 60% Reranker
+///
+/// RRF only orders documents, so the reported score scales that order by the best backend score
+/// in the result set: a weak query scores low instead of its top hit always reading `1.0`.
 pub fn execute_hybrid_query(
     conn: &Connection,
     embedder: &dyn EmbeddingProvider,
@@ -40,6 +44,7 @@ pub fn execute_hybrid_query(
     req: &HybridQueryRequest,
 ) -> WikiResult<Vec<SearchResultItem>> {
     let candidate_limit = req.candidate_limit.unwrap_or(40).max(req.limit);
+    let semantic = embedder.is_semantic();
 
     // Build effective sub-queries list
     let mut sub_queries: Vec<SubQuery> = req.searches.clone();
@@ -50,10 +55,12 @@ pub fn execute_hybrid_query(
                 query_type: SubQueryType::Lex,
                 query: q.clone(),
             });
-            sub_queries.push(SubQuery {
-                query_type: SubQueryType::Vec,
-                query: q.clone(),
-            });
+            if semantic {
+                sub_queries.push(SubQuery {
+                    query_type: SubQueryType::Vec,
+                    query: q.clone(),
+                });
+            }
             if let Some(rr) = reranker {
                 if let Ok(expanded) = rr.expand_query(q, req.intent.as_deref()) {
                     for exp in expanded {
@@ -85,62 +92,60 @@ pub fn execute_hybrid_query(
             sq.query_type.as_str().to_string()
         };
 
-        match sq.query_type {
-            SubQueryType::Lex => {
-                let fts_list = search_fts_bm25(conn, &sq.query, &backend_opts)?;
-                for (rank, item) in fts_list.into_iter().enumerate() {
-                    let rrf_contrib = weight / (RRF_K + (rank as f32) + 1.0);
-                    let entry = accumulators
-                        .entry(item.rel_path.clone())
-                        .or_insert_with(|| RankedDocAccumulator {
-                            item: item.clone(),
-                            fts_scores: Vec::new(),
-                            vector_scores: Vec::new(),
-                            base_rrf_score: 0.0,
-                            best_rank: usize::MAX,
-                            contributions: Vec::new(),
-                        });
-                    entry.fts_scores.push(item.score);
-                    entry.base_rrf_score += rrf_contrib;
-                    entry.best_rank = entry.best_rank.min(rank);
-                    entry.contributions.push(RrfContribution {
-                        source: "fts".to_string(),
-                        query_type: query_type_label.clone(),
-                        query: sq.query.clone(),
-                        rank: rank + 1,
-                        weight,
-                        backend_score: item.score,
-                        rrf_contribution: rrf_contrib,
+        let use_vector = semantic && sq.query_type != SubQueryType::Lex;
+        if !use_vector {
+            let fts_list = search_fts_bm25(conn, &sq.query, &backend_opts)?;
+            for (rank, item) in fts_list.into_iter().enumerate() {
+                let rrf_contrib = weight / (RRF_K + (rank as f32) + 1.0);
+                let entry = accumulators
+                    .entry(item.rel_path.clone())
+                    .or_insert_with(|| RankedDocAccumulator {
+                        item: item.clone(),
+                        fts_scores: Vec::new(),
+                        vector_scores: Vec::new(),
+                        base_rrf_score: 0.0,
+                        best_rank: usize::MAX,
+                        contributions: Vec::new(),
                     });
-                }
+                entry.fts_scores.push(item.score);
+                entry.base_rrf_score += rrf_contrib;
+                entry.best_rank = entry.best_rank.min(rank);
+                entry.contributions.push(RrfContribution {
+                    source: "fts".to_string(),
+                    query_type: query_type_label.clone(),
+                    query: sq.query.clone(),
+                    rank: rank + 1,
+                    weight,
+                    backend_score: item.score,
+                    rrf_contribution: rrf_contrib,
+                });
             }
-            SubQueryType::Vec | SubQueryType::Hyde => {
-                let vec_list = search_vector(conn, embedder, &sq.query, &backend_opts)?;
-                for (rank, item) in vec_list.into_iter().enumerate() {
-                    let rrf_contrib = weight / (RRF_K + (rank as f32) + 1.0);
-                    let entry = accumulators
-                        .entry(item.rel_path.clone())
-                        .or_insert_with(|| RankedDocAccumulator {
-                            item: item.clone(),
-                            fts_scores: Vec::new(),
-                            vector_scores: Vec::new(),
-                            base_rrf_score: 0.0,
-                            best_rank: usize::MAX,
-                            contributions: Vec::new(),
-                        });
-                    entry.vector_scores.push(item.score);
-                    entry.base_rrf_score += rrf_contrib;
-                    entry.best_rank = entry.best_rank.min(rank);
-                    entry.contributions.push(RrfContribution {
-                        source: "vector".to_string(),
-                        query_type: query_type_label.clone(),
-                        query: sq.query.clone(),
-                        rank: rank + 1,
-                        weight,
-                        backend_score: item.score,
-                        rrf_contribution: rrf_contrib,
+        } else {
+            let vec_list = search_vector(conn, embedder, &sq.query, &backend_opts)?;
+            for (rank, item) in vec_list.into_iter().enumerate() {
+                let rrf_contrib = weight / (RRF_K + (rank as f32) + 1.0);
+                let entry = accumulators
+                    .entry(item.rel_path.clone())
+                    .or_insert_with(|| RankedDocAccumulator {
+                        item: item.clone(),
+                        fts_scores: Vec::new(),
+                        vector_scores: Vec::new(),
+                        base_rrf_score: 0.0,
+                        best_rank: usize::MAX,
+                        contributions: Vec::new(),
                     });
-                }
+                entry.vector_scores.push(item.score);
+                entry.base_rrf_score += rrf_contrib;
+                entry.best_rank = entry.best_rank.min(rank);
+                entry.contributions.push(RrfContribution {
+                    source: "vector".to_string(),
+                    query_type: query_type_label.clone(),
+                    query: sq.query.clone(),
+                    rank: rank + 1,
+                    weight,
+                    backend_score: item.score,
+                    rrf_contribution: rrf_contrib,
+                });
             }
         }
     }
@@ -155,24 +160,20 @@ pub fn execute_hybrid_query(
         .or_else(|| sub_queries.first().map(|s| s.query.as_str()))
         .unwrap_or("");
 
-    let has_any_fts_hit = accumulators.values().any(|acc| !acc.fts_scores.is_empty());
-
     // Compute total RRF score with Top-Rank Bonus
     let mut fused: Vec<(f32, f32, RankedDocAccumulator)> = accumulators
         .into_values()
         .filter(|acc| {
-            if !has_any_fts_hit || !acc.fts_scores.is_empty() {
+            if !acc.fts_scores.is_empty() {
                 return true;
             }
-            let max_vec = acc
-                .vector_scores
-                .iter()
-                .copied()
-                .fold(0.0f32, f32::max);
+            let max_vec = acc.vector_scores.iter().copied().fold(0.0f32, f32::max);
             max_vec >= WEAK_VECTOR_ONLY_CUTOFF
         })
         .map(|acc| {
-            let bonus = if acc.best_rank == 0 {
+            let bonus = if acc.fts_scores.is_empty() {
+                0.0
+            } else if acc.best_rank == 0 {
                 TOP_1_BONUS
             } else if acc.best_rank <= 2 {
                 TOP_2_3_BONUS
@@ -202,6 +203,12 @@ pub fn execute_hybrid_query(
     // Normalize RRF score to [0.0, 1.0] relative to theoretical max or top candidate
     let max_rrf = fused.first().map(|x| x.0).unwrap_or(1.0).max(0.05);
 
+    let confidence = fused
+        .iter()
+        .flat_map(|(_, _, acc)| acc.fts_scores.iter().chain(&acc.vector_scores))
+        .copied()
+        .fold(0.0f32, f32::max);
+
     // Optional Reranker step + Position-Aware Blending
 
     let rerank_scores: Option<Vec<f32>> = if req.rerank {
@@ -221,8 +228,8 @@ pub fn execute_hybrid_query(
     let mut final_results = Vec::with_capacity(fused.len());
     for (idx, (total_rrf, bonus, mut acc)) in fused.into_iter().enumerate() {
         let rrf_rank = idx + 1;
-        // Scale RRF score smoothly into [0.0, 1.0]
-        let rrf_norm = (total_rrf / max_rrf).clamp(0.0, 1.0);
+        // Scale RRF score smoothly into [0.0, confidence]
+        let rrf_norm = (total_rrf / max_rrf).clamp(0.0, 1.0) * confidence;
 
         let (rrf_weight, final_score, rerank_score_opt) = if let Some(ref r_scores) = rerank_scores
         {
@@ -274,6 +281,11 @@ pub fn execute_hybrid_query(
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.raw_backend_score
+                    .partial_cmp(&a.raw_backend_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .then_with(|| a.rel_path.cmp(&b.rel_path))
     });
     final_results.truncate(req.limit);

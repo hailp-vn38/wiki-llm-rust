@@ -1174,16 +1174,219 @@ fn test_multi_topic_compact_index_and_per_topic_autoflow_synthesis() {
         .exists());
 
     // On-disk WikiLink healing: `qmd-paper.md` links are rewritten to include `<domain>` so Obsidian resolves them natively
-    let qmd_on_disk =
-        std::fs::read_to_string(root.join("wiki/sources/ai-engineering/hybrid-search/qmd-paper.md"))
-            .unwrap();
+    let qmd_on_disk = std::fs::read_to_string(
+        root.join("wiki/sources/ai-engineering/hybrid-search/qmd-paper.md"),
+    )
+    .unwrap();
     assert!(qmd_on_disk
         .contains("[[concepts/ai-engineering/reciprocal-rank-fusion|Reciprocal Rank Fusion]]"));
-    assert!(qmd_on_disk
-        .contains("[[wiki/syntheses/ai-engineering/hybrid-search-synthesis|Hybrid Search Synthesis]]"));
+    assert!(qmd_on_disk.contains(
+        "[[wiki/syntheses/ai-engineering/hybrid-search-synthesis|Hybrid Search Synthesis]]"
+    ));
 
     let lint = engine.lint_wiki().unwrap();
     assert!(lint.is_healthy, "Expected healthy vault, got: {lint:?}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn lex_paths(engine: &WikiEngine, query: &str) -> Vec<String> {
+    engine
+        .search_lex(query, llm_wiki::SearchOptions::default())
+        .unwrap()
+        .into_iter()
+        .map(|item| item.rel_path)
+        .collect()
+}
+
+fn search_relevance_vault(name: &str) -> (std::path::PathBuf, WikiEngine) {
+    let root = create_temp_vault(name);
+    let engine = WikiEngine::open(&root).unwrap();
+    engine
+        .write_wiki_file(
+            "concepts/khong-khi-lanh.md",
+            "# Không khí lạnh\nKhông khí lạnh tràn về miền Đông Bắc Bộ gây rét đậm.",
+        )
+        .unwrap();
+    engine
+        .write_wiki_file(
+            "concepts/entry.md",
+            "# Điểm vào lệnh\nKhi giá đảo chiều, không vội vào lệnh mà chờ công thức xác nhận. Backend manifest.",
+        )
+        .unwrap();
+    engine
+        .write_wiki_file(
+            "concepts/linked.md",
+            "# Linked note\nSee [[sources/news/thoi-tiet-khong-khi-lanh/report|Javis report]] about pipelines.",
+        )
+        .unwrap();
+    (root, engine)
+}
+
+#[test]
+fn lexical_search_rejects_queries_the_vault_cannot_answer() {
+    let (root, engine) = search_relevance_vault("search_no_answer");
+
+    // Only `công thức` occurs in the vault; the OR fallback must not surface that page.
+    assert!(lex_paths(&engine, "công thức nấu phở bò").is_empty());
+
+    let results = engine
+        .query(HybridQueryRequest::from_query("công thức nấu phở bò"))
+        .unwrap();
+    assert!(results.is_empty());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn lexical_search_keeps_partially_matching_answers() {
+    let (root, engine) = search_relevance_vault("search_partial");
+
+    // 4 of 6 words occur: strict AND fails, coverage still accepts the page.
+    assert_eq!(
+        lex_paths(&engine, "thời tiết rét đậm miền Bắc Bộ khí lạnh")
+            .first()
+            .map(String::as_str),
+        Some("wiki/concepts/khong-khi-lanh.md")
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn accented_words_do_not_match_their_unaccented_homographs() {
+    let (root, engine) = search_relevance_vault("search_accents");
+
+    // `khí` must not match `Khi`; the entry page contains `không`, `Khi` but not `lạnh`.
+    assert_eq!(
+        lex_paths(&engine, "không khí"),
+        vec!["wiki/concepts/khong-khi-lanh.md".to_string()]
+    );
+    // Typing without diacritics still reaches the accented page.
+    assert_eq!(
+        lex_paths(&engine, "khong khi lanh")
+            .first()
+            .map(String::as_str),
+        Some("wiki/concepts/khong-khi-lanh.md")
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn short_syllables_do_not_prefix_match_longer_words() {
+    let (root, engine) = search_relevance_vault("search_prefix");
+
+    assert!(
+        lex_paths(&engine, "man").is_empty(),
+        "`man` must not match `manifest`"
+    );
+    assert_eq!(
+        lex_paths(&engine, "bac"),
+        vec!["wiki/concepts/khong-khi-lanh.md".to_string()],
+        "`bac` matches `Bắc` but not `Backend`"
+    );
+    assert_eq!(
+        lex_paths(&engine, "manif").len(),
+        1,
+        "long prefixes still match"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn wikilink_targets_are_not_searchable_but_aliases_are() {
+    let (root, engine) = search_relevance_vault("search_wikilink");
+
+    assert_eq!(
+        lex_paths(&engine, "thoi tiet"),
+        Vec::<String>::new(),
+        "folder names inside a link target are not content"
+    );
+    assert_eq!(
+        lex_paths(&engine, "Javis report"),
+        vec!["wiki/concepts/linked.md".to_string()]
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn or_fallback_runs_when_strict_matches_are_only_outside_the_collection() {
+    let (root, engine) = search_relevance_vault("search_scope_fallback");
+    engine
+        .write_source_file("raw.md", "# Raw\nkhông khí lạnh vanilla marker")
+        .unwrap();
+
+    // Strict AND only hits the source; the wiki page still covers 3 of 4 words.
+    assert_eq!(
+        lex_paths(&engine, "không khí lạnh marker")
+            .first()
+            .map(String::as_str),
+        Some("wiki/concepts/khong-khi-lanh.md")
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn hybrid_ignores_hash_vectors_and_reports_absolute_scores() {
+    let (root, engine) = search_relevance_vault("search_hybrid");
+
+    let gibberish = engine
+        .query(HybridQueryRequest::from_query("quantum computing"))
+        .unwrap();
+    assert!(
+        gibberish.is_empty(),
+        "hash collisions must not reach hybrid results"
+    );
+
+    let results = engine
+        .query(HybridQueryRequest {
+            query: Some("không khí lạnh".to_string()),
+            explain: true,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(results[0].rel_path, "wiki/concepts/khong-khi-lanh.md");
+    assert!(
+        results[0].score < 1.0,
+        "top score must not be forced to 1.0"
+    );
+    let explain = results[0].explain.as_ref().unwrap();
+    assert!(explain.vector_scores.is_empty());
+
+    let vec_only = engine
+        .query(HybridQueryRequest {
+            searches: vec![SubQuery {
+                query_type: SubQueryType::Vec,
+                query: "không khí lạnh".to_string(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(vec_only[0].rel_path, "wiki/concepts/khong-khi-lanh.md");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn opening_an_older_index_retokenizes_fts_bodies() {
+    let (root, engine) = search_relevance_vault("search_upgrade");
+    drop(engine);
+
+    let db = root.join(".wiki/index.sqlite");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "UPDATE documents_fts SET body = 'thoi tiet' WHERE rel_path = 'wiki/concepts/linked.md';
+         PRAGMA user_version = 0;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let engine = WikiEngine::open(&root).unwrap();
+    assert!(lex_paths(&engine, "thoi tiet").is_empty());
 
     let _ = std::fs::remove_dir_all(&root);
 }

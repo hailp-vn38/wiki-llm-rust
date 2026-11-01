@@ -226,6 +226,39 @@ pub fn extract_wikilinks_from_line(line: &str, line_number: usize, out: &mut Vec
     }
 }
 
+/// Rewrite `[[folder/page|Alias]]` to its visible text (`Alias`, or `page` without an alias) so
+/// search does not treat folder names inside link targets as document content.
+pub fn strip_wikilink_targets(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(open) = rest.find("[[") {
+        let inner_start = open + 2;
+        let Some(len) = rest[inner_start..].find("]]") else {
+            break;
+        };
+        let inner = &rest[inner_start..inner_start + len];
+        out.push_str(&rest[..open]);
+        if inner.contains('\n') {
+            out.push_str("[[");
+            rest = &rest[inner_start..];
+            continue;
+        }
+        match parse_wikilink_inner(inner, ExtractedLinkType::WikiLink, 0) {
+            Some(link) => {
+                let visible = link.display_alias.unwrap_or_else(|| {
+                    let leaf = link.target_path_spec.rsplit('/').next().unwrap_or_default();
+                    leaf.strip_suffix(".md").unwrap_or(leaf).to_string()
+                });
+                out.push_str(&visible);
+            }
+            None => out.push_str(inner.trim().trim_start_matches('#')),
+        }
+        rest = &rest[inner_start + len + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn parse_wikilink_inner(
     inner: &str,
     link_type: ExtractedLinkType,

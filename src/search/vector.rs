@@ -21,6 +21,11 @@ pub trait EmbeddingProvider: Send + Sync {
     fn model_name(&self) -> &str;
     /// Vector dimensionality (e.g., 256, 384, 768, 1536).
     fn dimensions(&self) -> usize;
+    /// Whether vector distance reflects meaning. Hybrid search leaves non-semantic embedders out
+    /// of ranking and answers `vec`/`hyde` sub-queries lexically.
+    fn is_semantic(&self) -> bool {
+        true
+    }
     /// Embed a search query (QMD formats queries as `"task: search result | query: {query}"`).
     fn embed_query(&self, query: &str) -> WikiResult<Vec<f32>>;
     /// Embed a batch of formatted document chunks (`"title: {title} | text: {content}"`).
@@ -110,6 +115,10 @@ impl LocalNgramEmbedder {
 impl EmbeddingProvider for LocalNgramEmbedder {
     fn model_name(&self) -> &str {
         "local-ngram-hash-256"
+    }
+
+    fn is_semantic(&self) -> bool {
+        false
     }
 
     fn dimensions(&self) -> usize {
