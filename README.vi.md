@@ -28,7 +28,7 @@ Thêm `llm-wiki-rs` vào `Cargo.toml`:
 
 ```toml
 [dependencies]
-llm-wiki-rs = "0.1.2"
+llm-wiki-rs = "0.1.3"
 ```
 
 > Lưu ý: Tên thư viện trong code Rust là `llm_wiki` (`use llm_wiki::*;`).

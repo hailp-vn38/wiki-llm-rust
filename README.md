@@ -28,7 +28,7 @@ Add `llm-wiki-rs` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-llm-wiki-rs = "0.1.2"
+llm-wiki-rs = "0.1.3"
 ```
 
 > Note: The library target name is `llm_wiki`, so you import it in Rust code with `use llm_wiki::*;`.
