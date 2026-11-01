@@ -4,7 +4,7 @@
 
 Thư viện Rust local-first kết hợp kiến trúc **[LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)** của Andrej Karpathy với động cơ xử lý & tìm kiếm **[QMD (Query Markup Documents)](https://github.com/tobi/qmd)**, tương thích 100% với **[Obsidian's Graph View](https://obsidian.md)**.
 
-- **Crate**: [`llm-wiki-rs`](https://crates.io/crates/llm-wiki-rs) `v0.2.0` (import trong Rust là `llm_wiki`), edition 2021
+- **Crate**: [`llm-wiki-rs`](https://crates.io/crates/llm-wiki-rs) `v0.2.1` (import trong Rust là `llm_wiki`), edition 2021
 - **Lưu trữ**: SQLite nhúng (`rusqlite` bundled + FTS5 BM25 + vector cosine distance + bảng đồ thị liên kết) nằm gọn tại `<data_root>/.wiki/index.sqlite`
 - **Tài liệu kiến trúc**: [ARCHITECTURE.md](./ARCHITECTURE.md) · [docs/karpathy-llm-wiki.md](./docs/karpathy-llm-wiki.md)
 
@@ -28,7 +28,7 @@ Thêm `llm-wiki-rs` vào `Cargo.toml`:
 
 ```toml
 [dependencies]
-llm-wiki-rs = "0.2.0"
+llm-wiki-rs = "0.2.1"
 ```
 
 > Lưu ý: Tên thư viện trong code Rust là `llm_wiki` (`use llm_wiki::*;`).
