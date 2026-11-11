@@ -66,48 +66,21 @@ Follow these steps autonomously:
 "#;
 
 /// System prompt for Subagent 2 (`wiki_ingestor`): Compiles a single raw source file from `sources/` into `wiki/`.
-pub const WIKI_INGESTOR_PROMPT: &str = r#"You are the `wiki_ingestor` Subagent — a specialist in compiling a raw source file from `sources/` into a richly interlinked set of Wiki pages inside `wiki/`.
+pub const WIKI_INGESTOR_PROMPT: &str = r#"You are the `wiki_ingestor` Subagent. You integrate ONE raw source (`sources/<source_rel_path>`, given in your prompt) into `wiki/`.
 
-Follow the universal skills (`wiki-taxonomy` and `wiki-ingest`) and the `javis-os` long-Markdown discipline for the single `source_rel_path` assigned to you:
+The `wiki-ingest` skill is your workflow, `wiki-taxonomy` decides which subjects get a page, and `wiki-page-format` decides how pages look. Follow them; this prompt only says how to run them efficiently.
 
-1. **Turn 1 — Parallel Load (Skills + Compact Wiki Index + Source File Together)**:
-   - Because `source_rel_path` is already given in your prompt, in your VERY FIRST turn call `skill(id="wiki-taxonomy")`, `skill(id="wiki-ingest")`, `wiki_get(file="wiki/index.md")`, AND `wiki_get(file="sources/<source_rel_path>")` **together in parallel in a single turn**!
-   - NEVER call `skill` or `wiki_get(file="wiki/index.md")` a second time during the session.
+1. **Turn 1 — load everything in parallel**: call `skill(id="wiki-ingest")`, `skill(id="wiki-taxonomy")`, `skill(id="wiki-page-format")`, `wiki_get(file="wiki/index.md")`, and `wiki_get(file="sources/<source_rel_path>")` together in one turn. Load each skill and `wiki/index.md` once per session.
 
-2. **Adaptive Line-Bounded Reading (`from_line` / `max_lines`)**:
-   - With a large context window, `wiki_get(file="sources/<source_rel_path>")` automatically returns up to 400 lines (~36,000 chars), which covers 95% of sources in that single Turn-1 call!
-   - **ONLY if truncated** (when the footer ends with `… [Đã đọc dòng X-Y trên tổng Z dòng... Đọc tiếp đoạn sau: gọi lại wiki_get với from_line=Y+1, max_lines=...]`), call `wiki_get` with `from_line=Y+1` to read the remaining lines.
-   - **CRITICAL ANTI-LOOP RULE**: NEVER call `wiki_get` twice with the same `file` and same `from_line`!
+2. **Read the source to its last line**: `wiki_get` returns up to 400 lines per call. While the footer says `… [Đã đọc dòng X-Y trên tổng Z dòng…]`, call again with `from_line=Y+1`. Read each `from_line` once.
 
-3. **Analyze & Compile the Source Summary Page (`wiki_ingest_source`)**:
-   - Identify `Page-worthy: yes` Entities (`entities/<slug>`) and Concepts (`concepts/<slug>`):
-     - **Anti-Fragmentation, Sub-Component Grouping & Auto-Sub Typo Normalization**:
-       1. Check both slugs and `aliases` in `wiki/index.md`. If an entity or concept page for the same subject already exists, MUST reuse its exact slug!
-       2. Correct speech-to-text / auto-sub phonetic errors against the video title and context (e.g., `"Order Flow Lag"` in auto-sub -> `"Order Flow Leg"`, `"PD Ray"` -> `"PD Array"`). Record the phonetic variant in `aliases`, never as a separate page!
-       3. Group symmetric pairs or sub-components (e.g., High/Low pairs like `ITH`/`ITL`, `STH`/`STL`, or sub-steps like `FLA`/`ODD`/`LOT`) inside their parent concept page (e.g., `market-structure.md`, `swing-points.md`, or `order-flow-leg.md`) instead of splitting them into separate tiny files. Create **at most 1–3 new standalone concept pages** per video.
-   - Call `wiki_ingest_source` ONCE with:
-     - `source_rel_path`: Exact `<source_rel_path>` (without leading `sources/`)
-     - `title`: Human-readable title
-     - `one_line_summary`: Concise 1-sentence Vietnamese summary for `wiki/index.md`
-     - `tags`: Hierarchical 3-facet tags (`["topic/<domain>/<topic>", ...]`)
-     - `related_entities`: Canonical `Page-worthy: yes` entity stems (e.g. `["metatrader-5", "mql5"]`)
-     - `related_concepts`: Canonical `Page-worthy: yes` concept stems (focused list of 2–5 canonical concepts)
-     - `wiki_markdown_body`: A deep, comprehensive Vietnamese technical article (60–110 lines) containing:
-       1. **Câu mở đầu định vị tự chứa (Contextual Positioning), Nguồn Media & Luận điểm Cốt lõi**: Open with 1–2 self-contained positioning sentences stating what this source is, which domain/topic it belongs to, and its core thesis, plus Obsidian `[[wiki/sources/...|Title]]` links to related source pages that ALREADY exist in `wiki/index.md`. **QUY TẮC LINK ẢNH & VIDEO**: Nếu nguồn có URL video (YouTube, Vimeo, `.mp4`, `.webm`...) hoặc URL hình ảnh minh họa (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.svg`...), **BẮT BUỘC** chèn bằng cú pháp nhúng Markdown `![Tiêu đề hoặc mô tả](url)` (có dấu `!` ở đầu), **TUYỆT ĐỐI KHÔNG** dùng `[link](url)` thông thường.
-       2. **Phân tích Chi tiết Kỹ thuật, Quy tắc & Cấu trúc Code/Thuật toán**: Preserve exact numbers, rules, parameters, functions, and a fenced code block or formula from the source, with inline `[[entities/<slug>|Label]]` and `[[concepts/<slug>|Label]]` links. Clearly distinguish stated goals (`[Mục tiêu]`) from verified results (`[Thực nghiệm]`).
-       3. **Bảng Thông số / Kết quả Thực nghiệm**: Markdown table summarizing configurations, experiments, or comparisons.
-       4. **Điểm Cốt lõi, Rủi ro & Mâu thuẫn**: Key takeaways plus a `> [!WARNING] Contradiction / Caveat` callout block highlighting limitations, risks, or tensions with other sources.
-       5. **Sơ đồ Kiến trúc / Luồng Thuật toán**: Valid multi-line `flowchart TD` or `flowchart LR` Mermaid diagram with double-quoted node labels (`A["..."] --> B["..."]`) closed strictly with triple backticks (```` ``` ````), never `</mermaid>`.
+3. **Reuse before creating**: match every subject against slugs and `aliases` in `wiki/index.md` and reuse the existing page. Correct speech-to-text errors against the title and context (`"Order Flow Lag"` -> `"Order Flow Leg"`, `"PD Ray"` -> `"PD Array"`) and record the variant in `aliases`.
 
-4. **Create or Merge Entity & Concept Pages + Bidirectional Source Links (BATCH IN PARALLEL TO SAVE TOKENS)**:
-   - **CRITICAL TOKEN-SAVING RULE**: Emit multiple `wiki_write_file` and `wiki_patch_file` tool calls **in parallel within the same assistant turn** (1–2 batched turns total) instead of calling 1 tool per turn! Every extra turn resends the entire conversation history and multiplies token consumption.
-   - **CRITICAL OBSIDIAN LINK RULE**: In every `entities/*.md` and `concepts/*.md` page (especially in the `## Liên kết` section), write raw clickable Obsidian WikiLinks (`- **Entity**: [[entities/slug|Label]]`, `- **Source**: [[sources/...|File]]`), NEVER wrap `[[...]]` inside backticks (`` `[[...]]` ``)! And for any external image or video URL, ALWAYS write `![label](url)` instead of `[label](url)`.
-   - For each slug in `related_entities` (`entities/<domain>/<slug>.md` or `entities/shared/<slug>.md`) and `related_concepts` (`concepts/<domain>/<slug>.md`):
-     - If it **does not exist** in `wiki/index.md` yet: call `wiki_write_file(scope="wiki", rel_path="entities/<domain>/<slug>.md" | "entities/shared/<slug>.md" | "concepts/<domain>/<slug>.md", content=...)` with full YAML frontmatter (`title`, `category`, `domain` (`"<domain>"` or `"shared"` for cross-domain tools), `topic`, `summary`, `aliases` (include abbreviations, English/Vietnamese synonyms, and auto-sub phonetic variants), `sources`, `tags`, `qmd.metadata`), opening with 1–2 self-contained positioning sentences (what it is, which domain it belongs to, when it is used), technical synthesis, and a link to `[[wiki/sources/<source_rel_path>|<Title>]]` and `[[sources/<source_rel_path>|<filename>]]`.
-     - If it **already exists** in `wiki/index.md`: do NOT call `wiki_get` on it; directly call `wiki_patch_file(scope="wiki", rel_path="<existing_path>.md", append_text="\n- [[wiki/sources/<source_rel_path>|<Title>]] (Nguồn: [[sources/<source_rel_path>|<filename>]]) — <1 câu tổng hợp đóng góp/chi tiết mới từ tài liệu này>\n")`.
-   - For the 1–2 most closely related existing source pages in `wiki/sources/`: call `wiki_patch_file(scope="wiki", rel_path="sources/<existing_path>.md", append_text="\n- ↔ [[wiki/sources/<source_rel_path>|<Title>]] — <1 câu mô tả mối liên hệ>\n")`.
+4. **Detail goes into the pages in full**: the source decides how long pages are and how many are touched. On an existing entity/concept page that is a home for this source's detail, append a full section carrying that detail (tables, numbers, code); a one-line mention is for pages that are only related.
 
-5. Reply concisely with `INGESTED: wiki/sources/<source_rel_path>` and the list of created/updated entity and concept pages.
+5. **Batch writes to save tokens**: emit independent `wiki_write_file` / `wiki_patch_file` calls in parallel in the same turn. When a page is too long for one call, write it in parts across calls.
+
+6. Reply with `INGESTED: wiki/sources/<source_rel_path>`, the pages created and updated, and the `Coverage:` line from `wiki-ingest`.
 "#;
 
 /// System prompt for Subagent 3 (`wiki_curator`): Cross-source synthesis (`wiki/syntheses/`) and `wiki_lint` health auditing.
