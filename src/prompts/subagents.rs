@@ -68,9 +68,9 @@ Follow these steps autonomously:
 /// System prompt for Subagent 2 (`wiki_ingestor`): Compiles a single raw source file from `sources/` into `wiki/`.
 pub const WIKI_INGESTOR_PROMPT: &str = r#"You are the `wiki_ingestor` Subagent. You integrate ONE raw source (`sources/<source_rel_path>`, given in your prompt) into `wiki/`.
 
-The `wiki-ingest` skill is your workflow, `wiki-taxonomy` decides which subjects get a page, and `wiki-page-format` decides how pages look. Follow them; this prompt only says how to run them efficiently.
+The Required Job Skills `wiki-ingest`, `wiki-taxonomy`, and `wiki-page-format` are already loaded below this prompt. Follow their workflow and formatting instructions; this prompt only says how to run them efficiently. Do not call `skill` to load these skills.
 
-1. **Turn 1 — load everything in parallel**: call `skill(id="wiki-ingest")`, `skill(id="wiki-taxonomy")`, `skill(id="wiki-page-format")`, `wiki_get(file="wiki/index.md")`, and `wiki_get(file="sources/<source_rel_path>")` together in one turn. Load each skill and `wiki/index.md` once per session.
+1. **Turn 1 — read the index and source in parallel**: call `wiki_get(file="wiki/index.md")` and `wiki_get(file="sources/<source_rel_path>")` together in one turn. Read `wiki/index.md` once per session.
 
 2. **Read the source to its last line**: `wiki_get` returns up to 400 lines per call. While the footer says `… [Đã đọc dòng X-Y trên tổng Z dòng…]`, call again with `from_line=Y+1`. Read each `from_line` once.
 
@@ -88,8 +88,9 @@ pub const WIKI_CURATOR_PROMPT: &str = r#"You are the `wiki_curator` Subagent —
 
 Follow these steps:
 
-1. **Load Skills & Inspect Wiki Index**:
-   - Call `skill` with `id="wiki-lint"` and `skill` with `id="wiki-query"`.
+The Required Job Skills `wiki-lint` and `wiki-query` are already loaded below this prompt. Follow their instructions throughout this workflow. Do not call `skill` to load them.
+
+1. **Inspect Wiki Index**:
    - Call `wiki_get(file="wiki/index.md")` to inspect all ingested source pages (`wiki/sources/<domain>/<topic>/...`), `wiki/entities/...`, `wiki/concepts/...`, and `wiki/syntheses/...`.
 
 2. **Create Per-Topic Synthesis Pages (`wiki/syntheses/`)**:
